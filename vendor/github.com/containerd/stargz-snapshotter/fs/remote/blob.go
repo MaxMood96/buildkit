@@ -26,14 +26,13 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/containerd/containerd/reference"
+	"github.com/containerd/containerd/v2/pkg/reference"
 	"github.com/containerd/stargz-snapshotter/cache"
 	"github.com/containerd/stargz-snapshotter/fs/source"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -193,7 +192,7 @@ func (b *blob) cacheAt(offset int64, size int64, fr fetcher, cacheOpts *options)
 		if r, err := b.cache.Get(fr.genID(reg), cacheOpts.cacheOpts...); err == nil {
 			return r.Close() // nop if the cache hits
 		}
-		discard[reg] = ioutil.Discard
+		discard[reg] = io.Discard
 		return nil
 	})
 	if err != nil {

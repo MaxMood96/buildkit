@@ -10,18 +10,18 @@ import (
 )
 
 type UsageInfo struct {
-	ID      string
-	Mutable bool
-	InUse   bool
-	Size    int64
+	ID      string `json:"id"`
+	Mutable bool   `json:"mutable"`
+	InUse   bool   `json:"inUse"`
+	Size    int64  `json:"size"`
 
-	CreatedAt   time.Time
-	LastUsedAt  *time.Time
-	UsageCount  int
-	Parents     []string
-	Description string
-	RecordType  UsageRecordType
-	Shared      bool
+	CreatedAt   time.Time       `json:"createdAt"`
+	LastUsedAt  *time.Time      `json:"lastUsedAt"`
+	UsageCount  int             `json:"usageCount"`
+	Parents     []string        `json:"parents"`
+	Description string          `json:"description"`
+	RecordType  UsageRecordType `json:"recordType"`
+	Shared      bool            `json:"shared"`
 }
 
 func (c *Client) DiskUsage(ctx context.Context, opts ...DiskUsageOption) ([]*UsageInfo, error) {
@@ -31,7 +31,7 @@ func (c *Client) DiskUsage(ctx context.Context, opts ...DiskUsageOption) ([]*Usa
 	}
 
 	req := &controlapi.DiskUsageRequest{Filter: info.Filter}
-	resp, err := c.controlClient().DiskUsage(ctx, req)
+	resp, err := c.ControlClient().DiskUsage(ctx, req)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to call diskusage")
 	}
@@ -43,14 +43,20 @@ func (c *Client) DiskUsage(ctx context.Context, opts ...DiskUsageOption) ([]*Usa
 			ID:          d.ID,
 			Mutable:     d.Mutable,
 			InUse:       d.InUse,
-			Size:        d.Size_,
+			Size:        d.Size,
 			Parents:     d.Parents,
-			CreatedAt:   d.CreatedAt,
+			CreatedAt:   d.CreatedAt.AsTime(),
 			Description: d.Description,
 			UsageCount:  int(d.UsageCount),
-			LastUsedAt:  d.LastUsedAt,
-			RecordType:  UsageRecordType(d.RecordType),
-			Shared:      d.Shared,
+			LastUsedAt: func() *time.Time {
+				if d.LastUsedAt != nil {
+					ts := d.LastUsedAt.AsTime()
+					return &ts
+				}
+				return nil
+			}(),
+			RecordType: UsageRecordType(d.RecordType),
+			Shared:     d.Shared,
 		})
 	}
 

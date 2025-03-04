@@ -3,6 +3,7 @@ package solver
 import (
 	"context"
 	"io"
+	"sort"
 	"time"
 
 	"github.com/moby/buildkit/util/bklog"
@@ -59,7 +60,9 @@ func (j *Job) Status(ctx context.Context, ch chan *client.SolveStatus) error {
 					bklog.G(ctx).Warnf("progress %s log without vertex info", p.ID)
 					continue
 				}
-				v.Vertex = vtx.(digest.Digest)
+				if v.Vertex == "" {
+					v.Vertex = vtx.(digest.Digest)
+				}
 				v.Timestamp = p.Timestamp
 				ss.Logs = append(ss.Logs, &v)
 			case client.VertexWarning:
@@ -68,13 +71,31 @@ func (j *Job) Status(ctx context.Context, ch chan *client.SolveStatus) error {
 					bklog.G(ctx).Warnf("progress %s warning without vertex info", p.ID)
 					continue
 				}
-				v.Vertex = vtx.(digest.Digest)
+				if v.Vertex == "" {
+					v.Vertex = vtx.(digest.Digest)
+				}
 				ss.Warnings = append(ss.Warnings, &v)
 			}
 		}
+		sort.Slice(ss.Vertexes, func(i, j int) bool {
+			if ss.Vertexes[i].Started == nil {
+				return true
+			}
+			if ss.Vertexes[j].Started == nil {
+				return false
+			}
+			return ss.Vertexes[i].Started.Before(*ss.Vertexes[j].Started)
+		})
+		sort.Slice(ss.Statuses, func(i, j int) bool {
+			return ss.Statuses[i].Timestamp.Before(ss.Statuses[j].Timestamp)
+		})
+		sort.Slice(ss.Logs, func(i, j int) bool {
+			return ss.Logs[i].Timestamp.Before(ss.Logs[j].Timestamp)
+		})
+
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return context.Cause(ctx)
 		case ch <- ss:
 		}
 	}

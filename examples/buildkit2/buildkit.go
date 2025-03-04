@@ -18,8 +18,8 @@ type buildOpt struct {
 func main() {
 	var opt buildOpt
 	flag.BoolVar(&opt.withContainerd, "with-containerd", true, "enable containerd worker")
-	flag.StringVar(&opt.containerd, "containerd", "v1.2.9", "containerd version")
-	flag.StringVar(&opt.runc, "runc", "v1.0.0-rc8", "runc version")
+	flag.StringVar(&opt.containerd, "containerd", "v1.7.2", "containerd version")
+	flag.StringVar(&opt.runc, "runc", "v1.1.7", "runc version")
 	flag.Parse()
 
 	bk := buildkit(opt)
@@ -33,7 +33,7 @@ func main() {
 }
 
 func goBuildBase() llb.State {
-	goAlpine := llb.Image("docker.io/library/golang:1.17-alpine")
+	goAlpine := llb.Image("docker.io/library/golang:1.23-alpine")
 	return goAlpine.
 		AddEnv("PATH", "/usr/local/go/bin:"+system.DefaultPathEnvUnix).
 		AddEnv("GOPATH", "/go").
@@ -59,7 +59,7 @@ func containerd(version string) llb.State {
 	return goRepo(
 		goBuildBase().
 			Run(llb.Shlex("apk add --no-cache btrfs-progs-dev")).Root(),
-		"github.com/containerd/containerd", version, llb.KeepGitDir())(
+		"github.com/containerd/containerd/v2/client", version, llb.KeepGitDir())(
 		llb.Shlex("make bin/containerd"),
 	)
 }
@@ -67,23 +67,22 @@ func containerd(version string) llb.State {
 func buildkit(opt buildOpt) llb.State {
 	run := goRepo(goBuildBase(), "github.com/moby/buildkit", "master")
 
-	buildkitdOCIWorkerOnly := run(llb.Shlex("go build -o ./bin/buildkitd.oci_only -tags no_containerd_worker ./cmd/buildkitd"))
-
 	buildkitd := run(llb.Shlex("go build -o ./bin/buildkitd ./cmd/buildkitd"))
 
 	buildctl := run(llb.Shlex("go build -o ./bin/buildctl ./cmd/buildctl"))
 
 	r := llb.Image("docker.io/library/alpine:latest").With(
 		copyAll(buildctl, "/bin"),
+		copyAll(buildkitd, "/bin"),
 		copyAll(runc(opt.runc), "/bin"),
 	)
 
 	if opt.withContainerd {
-		return r.With(
+		r = r.With(
 			copyAll(containerd(opt.containerd), "/bin"),
-			copyAll(buildkitd, "/bin"))
+		)
 	}
-	return r.With(copyAll(buildkitdOCIWorkerOnly, "/bin"))
+	return r
 }
 
 func copyAll(src llb.State, destPath string) llb.StateOption {

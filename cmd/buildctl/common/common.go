@@ -1,14 +1,18 @@
 package common
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
+	"text/template"
 	"time"
 
 	"github.com/moby/buildkit/client"
-	"github.com/moby/buildkit/util/tracing/detect"
+	"github.com/moby/buildkit/util/tracing/delegated"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli"
 	"go.opentelemetry.io/otel/trace"
@@ -61,30 +65,63 @@ func ResolveClient(c *cli.Context) (*client.Client, error) {
 		key = c.GlobalString("tlskey")
 	}
 
-	opts := []client.ClientOpt{client.WithFailFast()}
-
 	ctx := CommandContext(c)
-
+	var opts []client.ClientOpt
 	if span := trace.SpanFromContext(ctx); span.SpanContext().IsValid() {
-		opts = append(opts, client.WithTracerProvider(span.TracerProvider()))
-
-		exp, err := detect.Exporter()
-		if err != nil {
-			return nil, err
-		}
-
-		if td, ok := exp.(client.TracerDelegate); ok {
-			opts = append(opts, client.WithTracerDelegate(td))
-		}
+		opts = append(opts,
+			client.WithTracerProvider(span.TracerProvider()),
+			client.WithTracerDelegate(delegated.DefaultExporter),
+		)
 	}
 
-	if caCert != "" || cert != "" || key != "" {
-		opts = append(opts, client.WithCredentials(serverName, caCert, cert, key))
+	if caCert != "" {
+		opts = append(opts, client.WithServerConfig(serverName, caCert))
+	}
+	if cert != "" || key != "" {
+		opts = append(opts, client.WithCredentials(cert, key))
 	}
 
 	timeout := time.Duration(c.GlobalInt("timeout"))
-	ctx, cancel := context.WithTimeout(ctx, timeout*time.Second)
-	defer cancel()
+	if timeout > 0 {
+		ctx2, cancel := context.WithCancelCause(ctx)
+		ctx2, _ = context.WithTimeoutCause(ctx2, timeout*time.Second, errors.WithStack(context.DeadlineExceeded))
+		ctx = ctx2
+		defer func() { cancel(errors.WithStack(context.Canceled)) }()
+	}
 
-	return client.New(ctx, c.GlobalString("addr"), opts...)
+	cl, err := client.New(ctx, c.GlobalString("addr"), opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	wait := c.GlobalBool("wait")
+	if wait {
+		if err := cl.Wait(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	return cl, nil
+}
+
+func ParseTemplate(format string) (*template.Template, error) {
+	// aliases is from https://github.com/containerd/nerdctl/blob/v0.17.1/cmd/nerdctl/fmtutil.go#L116-L126 (Apache License 2.0)
+	aliases := map[string]string{
+		"json": "{{json .}}",
+	}
+	if alias, ok := aliases[format]; ok {
+		format = alias
+	}
+	// funcs is from https://github.com/docker/cli/blob/v20.10.12/templates/templates.go#L12-L20 (Apache License 2.0)
+	funcs := template.FuncMap{
+		"json": func(v interface{}) string {
+			buf := &bytes.Buffer{}
+			enc := json.NewEncoder(buf)
+			enc.SetEscapeHTML(false)
+			enc.Encode(v)
+			// Remove the trailing new line added by the encoder
+			return strings.TrimSpace(buf.String())
+		},
+	}
+	return template.New("").Funcs(funcs).Parse(format)
 }

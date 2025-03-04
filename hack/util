@@ -1,67 +1,72 @@
-#!/usr/bin/env sh
-export BUILDX_NO_DEFAULT_LOAD=true
+#!/usr/bin/env bash
 
-: ${PREFER_BUILDCTL=}
-: ${PREFER_LEGACY=}
-: ${CI=}
-: ${GITHUB_ACTIONS=}
+: "${BUILDX_CMD=docker buildx}"
+: "${BUILDX_BUILDER=}"
 
-: ${CONTEXT=}
-: ${CACHE_FROM=}
-: ${CACHE_TO=}
+: "${GITHUB_ACTIONS=}"
+: "${GITHUB_REPOSITORY=}"
+: "${GITHUB_RUN_ID=}"
+: "${GITHUB_TOKEN=}"
 
-if [ "$PREFER_BUILDCTL" = "1" ]; then
-  echo >&2 "WARNING: PREFER_BUILDCTL is no longer supported. Ignoring."
-fi
+: "${CONTEXT=}"
+: "${CACHE_FROM=}"
+: "${CACHE_TO=}"
 
-if [ "$PREFER_LEGACY" = "1" ]; then
-  echo >&2 "WARNING: PREFER_LEGACY is no longer supported. Ignoring."
-fi
-
-progressFlag=""
-if [ "$CI" = "true" ]; then
-  progressFlag="--progress=plain"
-fi
+dockerCmd() {
+  (
+    set -x
+    docker "$@"
+  )
+}
 
 buildxCmd() {
-  if docker buildx version >/dev/null 2>&1; then
+  (
     set -x
-    docker buildx "$@" $progressFlag
-  elif buildx version >/dev/null 2>&1; then
-    set -x
-    buildx "$@" $progressFlag
-  else
-    topdir="$(realpath $(dirname "$0")/..)"
-    if [ ! -x "${topdir}/bin/buildx" ]; then
-      set -x
-      "${topdir}/hack/install-buildx"
+    BUILDX_NO_DEFAULT_LOAD=true BUILDX_BUILDER="${BUILDX_BUILDER}" ${BUILDX_CMD} "$@"
+  )
+}
+
+buildAttestFlags() {
+  if ${BUILDX_CMD} build --help 2>&1 | grep -- '--attest' >/dev/null; then
+    prvattrs="mode=max"
+    if [ "$GITHUB_ACTIONS" = "true" ]; then
+      prvattrs="$prvattrs,builder-id=https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
     fi
-    set -x
-    bootstrapName="moby-buildkit"
-    "${topdir}/hack/bootstrap-buildx" "${bootstrapName}"
-    BUILDX_BUILDER="${bootstrapName}" "${topdir}/bin/buildx" "$@" $progressFlag
+    echo "--attest=type=sbom --attest=type=provenance,$prvattrs"
   fi
 }
 
-currentref=""
 currentcontext="."
 cacheFromFlags=""
 cacheToFlags=""
-if [ "$GITHUB_ACTIONS" = "true" ]; then
-  currentref="https://github.com/$GITHUB_REPOSITORY.git#$GITHUB_REF"
+if [ "$GITHUB_ACTIONS" = "true" ] && [ "$GITHUB_REPOSITORY" = "moby/buildkit" ]; then
+  currentcontext="https://github.com/$GITHUB_REPOSITORY.git#$GITHUB_REF"
   if [ -n "$CACHE_FROM" ]; then
     for cfrom in $CACHE_FROM; do
+      if [[ $cfrom == *"type=gha"* ]]; then
+        if [[ -n "$GITHUB_REPOSITORY" ]] && [[ $cfrom != *"repository="* ]]; then
+          cfrom="${cfrom},repository=${GITHUB_REPOSITORY}"
+        fi
+        if [[ -n "$GITHUB_TOKEN" ]] && [[ $cfrom != *"ghtoken="* ]]; then
+          cfrom="${cfrom},ghtoken=${GITHUB_TOKEN}"
+        fi
+      fi
       cacheFromFlags="${cacheFromFlags}--cache-from=$cfrom "
     done
   fi
   if [ -n "$CACHE_TO" ]; then
     for cto in $CACHE_TO; do
+      if [[ $cto == *"type=gha"* ]]; then
+        if [[ -n "$GITHUB_REPOSITORY" ]] && [[ $cto != *"repository="* ]]; then
+          cto="${cto},repository=${GITHUB_REPOSITORY}"
+        fi
+        if [[ -n "$GITHUB_TOKEN" ]] && [[ $cto != *"ghtoken="* ]]; then
+          cto="${cto},ghtoken=${GITHUB_TOKEN}"
+        fi
+      fi
       cacheToFlags="${cacheToFlags}--cache-to=$cto "
     done
   fi
-fi
-if [ -n "$currentref" ]; then
-  currentcontext="--build-arg BUILDKIT_CONTEXT_KEEP_GIT_DIR=1 $currentref"
 fi
 if [ -n "$CONTEXT" ]; then
   currentcontext=$CONTEXT

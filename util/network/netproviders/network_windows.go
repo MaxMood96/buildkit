@@ -1,11 +1,10 @@
 //go:build windows
-// +build windows
 
 package netproviders
 
 import (
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/network"
-	"github.com/sirupsen/logrus"
 )
 
 func getHostProvider() (network.Provider, bool) {
@@ -13,6 +12,6 @@ func getHostProvider() (network.Provider, bool) {
 }
 
 func getFallback() (network.Provider, string) {
-	logrus.Warn("using null network as the default")
+	bklog.L.Warn("using null network as the default")
 	return network.NewNoneProvider(), ""
 }

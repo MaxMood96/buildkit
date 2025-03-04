@@ -8,6 +8,7 @@ import (
 	"github.com/moby/buildkit/solver/pb"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 )
 
 func TestFileMkdir(t *testing.T) {
@@ -26,8 +27,8 @@ func TestFileMkdir(t *testing.T) {
 	require.Equal(t, m[dgst], arr[1])
 
 	f := arr[1].Op.(*pb.Op_File).File
-	require.Equal(t, len(arr[1].Inputs), 1)
-	require.Equal(t, m[arr[1].Inputs[0].Digest], arr[0])
+	require.Equal(t, 1, len(arr[1].Inputs))
+	require.Equal(t, arr[0], m[arr[1].Inputs[0].Digest])
 	require.Equal(t, 0, int(arr[1].Inputs[0].Index))
 
 	require.Equal(t, 1, len(f.Actions))
@@ -60,7 +61,7 @@ func TestFileMkdirChain(t *testing.T) {
 	require.Equal(t, m[dgst], arr[1])
 
 	f := arr[1].Op.(*pb.Op_File).File
-	require.Equal(t, len(arr[1].Inputs), 1)
+	require.Equal(t, 1, len(arr[1].Inputs))
 	require.Equal(t, m[arr[1].Inputs[0].Digest], arr[0])
 	require.Equal(t, 0, int(arr[1].Inputs[0].Index))
 
@@ -113,7 +114,7 @@ func TestFileMkdirMkfile(t *testing.T) {
 	require.Equal(t, m[dgst], arr[0])
 
 	f := arr[0].Op.(*pb.Op_File).File
-	require.Equal(t, len(arr[1].Inputs), 1)
+	require.Equal(t, 1, len(arr[1].Inputs))
 	require.Equal(t, m[arr[1].Inputs[0].Digest], arr[0])
 	require.Equal(t, 0, int(arr[1].Inputs[0].Index))
 
@@ -159,7 +160,7 @@ func TestFileMkfile(t *testing.T) {
 	require.Equal(t, m[dgst], arr[1])
 
 	f := arr[1].Op.(*pb.Op_File).File
-	require.Equal(t, len(arr[1].Inputs), 1)
+	require.Equal(t, 1, len(arr[1].Inputs))
 	require.Equal(t, m[arr[1].Inputs[0].Digest], arr[0])
 	require.Equal(t, 0, int(arr[1].Inputs[0].Index))
 
@@ -178,6 +179,67 @@ func TestFileMkfile(t *testing.T) {
 	require.Equal(t, int64(-1), mkdir.Timestamp)
 }
 
+func TestFileSymlink(t *testing.T) {
+	t.Parallel()
+
+	st := Image("foo").Dir("/src").File(
+		Mkdir("dir", 0o755).
+			Symlink("/src/dir", "/srcdir").
+			Mkfile("/srcdir/file", 0700, []byte("asdfjkl;")).
+			Symlink("dir/file", "/srcdirfile").
+			Mkdir("/src/dir/subdir", 0o755).
+			Symlink("/src/dir/subdir", "/src/dir/subdir/nested"))
+
+	const numOps = 2
+	const numActions = 6
+	def, err := st.Marshal(context.TODO())
+
+	require.NoError(t, err)
+
+	m, arr := parseDef(t, def.Def)
+	require.Equal(t, numOps+1, len(arr))
+
+	dgst, idx := last(t, arr)
+	require.Equal(t, 0, idx)
+	require.Equal(t, m[dgst], arr[numOps-1])
+
+	fileOpNode := arr[1]
+	fileOp := fileOpNode.Op.(*pb.Op_File).File
+	require.Equal(t, numActions, len(fileOp.Actions))
+	require.Equal(t, 1, len(fileOpNode.Inputs))
+	require.Equal(t, m[fileOpNode.Inputs[0].Digest], arr[0])
+	require.Equal(t, 0, int(fileOpNode.Inputs[0].Index))
+
+	symlinkTests := []*pb.FileActionSymlink{
+		nil,
+		{Oldpath: "/src/dir", Newpath: "/srcdir"},
+		nil,
+		{Oldpath: "dir/file", Newpath: "/srcdirfile"},
+		nil,
+		{Oldpath: "/src/dir/subdir", Newpath: "/src/dir/subdir/nested"},
+	}
+
+	for i := 0; i < numActions; i++ {
+		expectedOutput := -1
+		if i == numActions-1 {
+			expectedOutput = 0
+		}
+
+		require.Equal(t, int(fileOp.Actions[i].Input), i)
+		require.Equal(t, -1, int(fileOp.Actions[i].SecondaryInput))
+		require.Equal(t, expectedOutput, int(fileOp.Actions[i].Output))
+
+		if symlinkTests[i] == nil {
+			continue
+		}
+
+		symlink := fileOp.Actions[i].Action.(*pb.FileAction_Symlink).Symlink
+
+		require.Equal(t, symlink.Oldpath, symlinkTests[i].Oldpath)
+		require.Equal(t, symlink.Newpath, symlinkTests[i].Newpath)
+	}
+}
+
 func TestFileRm(t *testing.T) {
 	t.Parallel()
 
@@ -194,7 +256,7 @@ func TestFileRm(t *testing.T) {
 	require.Equal(t, m[dgst], arr[1])
 
 	f := arr[1].Op.(*pb.Op_File).File
-	require.Equal(t, len(arr[1].Inputs), 1)
+	require.Equal(t, 1, len(arr[1].Inputs))
 	require.Equal(t, m[arr[1].Inputs[0].Digest], arr[0])
 	require.Equal(t, 0, int(arr[1].Inputs[0].Index))
 
@@ -235,7 +297,7 @@ func TestFileSimpleChains(t *testing.T) {
 	require.Equal(t, m[dgst], arr[2])
 
 	f := arr[2].Op.(*pb.Op_File).File
-	require.Equal(t, len(arr[2].Inputs), 1)
+	require.Equal(t, 1, len(arr[2].Inputs))
 	require.Equal(t, m[arr[2].Inputs[0].Digest], arr[1])
 	require.Equal(t, 0, int(arr[2].Inputs[0].Index))
 	require.Equal(t, 2, len(f.Actions))
@@ -257,7 +319,7 @@ func TestFileSimpleChains(t *testing.T) {
 	require.Equal(t, "/abc", mkfile.Path)
 
 	f = arr[1].Op.(*pb.Op_File).File
-	require.Equal(t, len(arr[1].Inputs), 1)
+	require.Equal(t, 1, len(arr[1].Inputs))
 	require.Equal(t, m[arr[1].Inputs[0].Digest], arr[0])
 	require.Equal(t, 0, int(arr[1].Inputs[0].Index))
 	require.Equal(t, 3, len(f.Actions))
@@ -513,7 +575,7 @@ func TestFileOwner(t *testing.T) {
 	require.Equal(t, m[dgst], arr[1])
 
 	f := arr[1].Op.(*pb.Op_File).File
-	require.Equal(t, len(arr[1].Inputs), 1)
+	require.Equal(t, 1, len(arr[1].Inputs))
 	require.Equal(t, m[arr[1].Inputs[0].Digest], arr[0])
 	require.Equal(t, 0, int(arr[1].Inputs[0].Index))
 
@@ -534,6 +596,57 @@ func TestFileOwner(t *testing.T) {
 	require.Equal(t, "foouser", mkdir.Owner.User.User.(*pb.UserOpt_ByName).ByName.Name)
 	require.Equal(t, 0, int(mkdir.Owner.User.User.(*pb.UserOpt_ByName).ByName.Input))
 	require.Nil(t, mkdir.Owner.Group)
+}
+
+func TestFileOwnerRoot(t *testing.T) {
+	t.Parallel()
+
+	st := Image("foo").File(Mkdir("bar/baz", 0701, WithUser("root:root")))
+	def, err := st.Marshal(context.TODO())
+
+	require.NoError(t, err)
+
+	_, arr := parseDef(t, def.Def)
+
+	action := arr[1].Op.(*pb.Op_File).File.Actions[0]
+	mkdir := action.Action.(*pb.FileAction_Mkdir).Mkdir
+
+	require.Equal(t, 0, int(mkdir.Owner.User.User.(*pb.UserOpt_ByID).ByID))
+	require.Equal(t, 0, int(mkdir.Owner.Group.User.(*pb.UserOpt_ByID).ByID))
+}
+
+func TestFileOwnerWithGroup(t *testing.T) {
+	t.Parallel()
+
+	st := Image("foo").File(Mkdir("bar/baz", 0701, WithUser("foo:bar")))
+	def, err := st.Marshal(context.TODO())
+
+	require.NoError(t, err)
+
+	_, arr := parseDef(t, def.Def)
+
+	action := arr[1].Op.(*pb.Op_File).File.Actions[0]
+	mkdir := action.Action.(*pb.FileAction_Mkdir).Mkdir
+
+	require.Equal(t, "foo", mkdir.Owner.User.User.(*pb.UserOpt_ByName).ByName.Name)
+	require.Equal(t, "bar", mkdir.Owner.Group.User.(*pb.UserOpt_ByName).ByName.Name)
+}
+
+func TestFileOwnerWithUIDAndGID(t *testing.T) {
+	t.Parallel()
+
+	st := Image("foo").File(Mkdir("bar/baz", 0701, WithUser("1000:1001")))
+	def, err := st.Marshal(context.TODO())
+
+	require.NoError(t, err)
+
+	_, arr := parseDef(t, def.Def)
+
+	action := arr[1].Op.(*pb.Op_File).File.Actions[0]
+	mkdir := action.Action.(*pb.FileAction_Mkdir).Mkdir
+
+	require.Equal(t, 1000, int(mkdir.Owner.User.User.(*pb.UserOpt_ByID).ByID))
+	require.Equal(t, 1001, int(mkdir.Owner.Group.User.(*pb.UserOpt_ByID).ByID))
 }
 
 func TestFileCopyOwner(t *testing.T) {
@@ -559,7 +672,7 @@ func TestFileCopyOwner(t *testing.T) {
 	require.Equal(t, m[dgst], arr[1])
 
 	f := arr[1].Op.(*pb.Op_File).File
-	require.Equal(t, len(arr[1].Inputs), 1)
+	require.Equal(t, 1, len(arr[1].Inputs))
 	require.Equal(t, m[arr[1].Inputs[0].Digest], arr[0])
 	require.Equal(t, 0, int(arr[1].Inputs[0].Index))
 
@@ -622,7 +735,7 @@ func TestFileCreatedTime(t *testing.T) {
 	require.Equal(t, m[dgst], arr[1])
 
 	f := arr[1].Op.(*pb.Op_File).File
-	require.Equal(t, len(arr[1].Inputs), 1)
+	require.Equal(t, 1, len(arr[1].Inputs))
 	require.Equal(t, m[arr[1].Inputs[0].Digest], arr[0])
 	require.Equal(t, 0, int(arr[1].Inputs[0].Index))
 
@@ -641,27 +754,60 @@ func TestFileCreatedTime(t *testing.T) {
 	require.Equal(t, dt3.UnixNano(), copy.Timestamp)
 }
 
-func parseDef(t *testing.T, def [][]byte) (map[digest.Digest]pb.Op, []pb.Op) {
-	m := map[digest.Digest]pb.Op{}
-	arr := make([]pb.Op, 0, len(def))
+func parseDef(t *testing.T, def [][]byte) (map[string]*pb.Op, []*pb.Op) {
+	m := map[string]*pb.Op{}
+	arr := make([]*pb.Op, 0, len(def))
 
 	for _, dt := range def {
 		var op pb.Op
-		err := (&op).Unmarshal(dt)
+		err := op.Unmarshal(dt)
 		require.NoError(t, err)
 		dgst := digest.FromBytes(dt)
-		m[dgst] = op
-		arr = append(arr, op)
+		m[string(dgst)] = &op
+		arr = append(arr, &op)
 		// fmt.Printf(":: %T %+v\n", op.Op, op)
 	}
 
 	return m, arr
 }
 
-func last(t *testing.T, arr []pb.Op) (digest.Digest, int) {
-	require.True(t, len(arr) > 1)
+func last(t *testing.T, arr []*pb.Op) (string, int) {
+	require.Greater(t, len(arr), 1)
 
 	op := arr[len(arr)-1]
 	require.Equal(t, 1, len(op.Inputs))
 	return op.Inputs[0].Digest, int(op.Inputs[0].Index)
+}
+
+func TestFileOpMarshalConsistency(t *testing.T) {
+	var prevDef [][]byte
+
+	f1 := Scratch().File(Mkfile("/tmp", 0644, []byte("tmp 1")))
+	f2 := Scratch().File(Mkfile("/a", 0644, []byte("tmp 2")))
+	st := Image("foo").Dir("/tmp").
+		File(Copy(f1, "/foo", "/bar")).
+		File(Copy(f2, "/a", "/b"))
+
+	for i := 0; i < 100; i++ {
+		def, err := st.Marshal(context.TODO())
+		require.NoError(t, err)
+
+		if prevDef != nil {
+			require.Equal(t, def.Def, prevDef)
+		}
+
+		prevDef = def.Def
+	}
+}
+
+func TestParallelMarshal(t *testing.T) {
+	st := Scratch().File(Mkfile("/tmp", 0644, []byte("tmp 1")))
+	eg, ctx := errgroup.WithContext(context.Background())
+	for i := 0; i < 100; i++ {
+		eg.Go(func() error {
+			_, err := st.Marshal(ctx)
+			return err
+		})
+	}
+	require.NoError(t, eg.Wait())
 }

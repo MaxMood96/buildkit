@@ -9,25 +9,25 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
-	"github.com/containerd/containerd/pkg/seed"
-	"github.com/containerd/containerd/pkg/userns"
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/containerd/remotes/docker"
-	"github.com/containerd/containerd/sys"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/defaults"
+	"github.com/containerd/containerd/v2/pkg/sys"
+	"github.com/containerd/platforms"
 	sddaemon "github.com/coreos/go-systemd/v22/daemon"
-	"github.com/docker/docker/pkg/reexec"
 	"github.com/gofrs/flock"
-	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
+	"github.com/hashicorp/go-multierror"
 	"github.com/moby/buildkit/cache/remotecache"
+	"github.com/moby/buildkit/cache/remotecache/azblob"
 	"github.com/moby/buildkit/cache/remotecache/gha"
 	inlineremotecache "github.com/moby/buildkit/cache/remotecache/inline"
 	localremotecache "github.com/moby/buildkit/cache/remotecache/local"
 	registryremotecache "github.com/moby/buildkit/cache/remotecache/registry"
+	s3remotecache "github.com/moby/buildkit/cache/remotecache/s3"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/cmd/buildkitd/config"
 	"github.com/moby/buildkit/control"
@@ -37,43 +37,53 @@ import (
 	"github.com/moby/buildkit/frontend/gateway"
 	"github.com/moby/buildkit/frontend/gateway/forwarder"
 	"github.com/moby/buildkit/session"
+	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/solver/bboltcachestorage"
+	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
 	"github.com/moby/buildkit/util/apicaps"
 	"github.com/moby/buildkit/util/appcontext"
 	"github.com/moby/buildkit/util/appdefaults"
 	"github.com/moby/buildkit/util/archutil"
 	"github.com/moby/buildkit/util/bklog"
+	"github.com/moby/buildkit/util/db/boltutil"
+	"github.com/moby/buildkit/util/disk"
 	"github.com/moby/buildkit/util/grpcerrors"
+	_ "github.com/moby/buildkit/util/grpcutil/encoding/proto"
 	"github.com/moby/buildkit/util/profiler"
 	"github.com/moby/buildkit/util/resolver"
 	"github.com/moby/buildkit/util/stack"
+	"github.com/moby/buildkit/util/tracing"
 	"github.com/moby/buildkit/util/tracing/detect"
 	_ "github.com/moby/buildkit/util/tracing/detect/jaeger"
 	_ "github.com/moby/buildkit/util/tracing/env"
 	"github.com/moby/buildkit/util/tracing/transform"
 	"github.com/moby/buildkit/version"
 	"github.com/moby/buildkit/worker"
+	"github.com/moby/sys/userns"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	"go.opentelemetry.io/otel/trace"
 	tracev1 "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	healthv1 "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/reflection"
+	"tags.cncf.io/container-device-interface/pkg/cdi"
 )
 
 func init() {
 	apicaps.ExportedProduct = "buildkit"
 	stack.SetVersionInfo(version.Version, version.Revision)
 
-	seed.WithTimeAndRand()
-	if reexec.Init() {
-		os.Exit(0)
-	}
+	// enable in memory recording for buildkitd traces
+	detect.Recorder = detect.NewTraceRecorder()
 }
 
 var propagators = propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})
@@ -139,6 +149,11 @@ func main() {
 		return strconv.Itoa(*gid)
 	}
 
+	groupUsageStr := "group (name or gid) which will own all Unix socket listening addresses"
+	if runtime.GOOS == "windows" {
+		groupUsageStr = "group name(s), comma-separated, which will have RW access to the named pipe listening addresses"
+	}
+
 	app.Flags = append(app.Flags,
 		cli.StringFlag{
 			Name:  "config",
@@ -148,6 +163,10 @@ func main() {
 		cli.BoolFlag{
 			Name:  "debug",
 			Usage: "enable debug output in logs",
+		},
+		cli.BoolFlag{
+			Name:  "trace",
+			Usage: "enable trace output in logs (highly verbose, could affect performance)",
 		},
 		cli.StringFlag{
 			Name:  "root",
@@ -159,15 +178,22 @@ func main() {
 			Usage: "listening address (socket or tcp)",
 			Value: &cli.StringSlice{defaultConf.GRPC.Address[0]},
 		},
+		// Add format flag to control log formatter
+		cli.StringFlag{
+			Name:  "log-format",
+			Usage: "log formatter: json or text",
+			Value: "text",
+		},
 		cli.StringFlag{
 			Name:  "group",
-			Usage: "group (name or gid) which will own all Unix socket listening addresses",
+			Usage: groupUsageStr,
 			Value: groupValue(defaultConf.GRPC.GID),
 		},
 		cli.StringFlag{
-			Name:  "debugaddr",
-			Usage: "debugging address (eg. 0.0.0.0:6060)",
-			Value: defaultConf.GRPC.DebugAddress,
+			Name:   "debugaddr",
+			Usage:  "debugging address (eg. 0.0.0.0:6060)",
+			Value:  defaultConf.GRPC.DebugAddress,
+			EnvVar: "BUILDKITD_DEBUGADDR",
 		},
 		cli.StringFlag{
 			Name:  "tlscert",
@@ -188,17 +214,31 @@ func main() {
 			Name:  "allow-insecure-entitlement",
 			Usage: "allows insecure entitlements e.g. network.host, security.insecure",
 		},
+		cli.StringFlag{
+			Name:  "otel-socket-path",
+			Usage: "OTEL collector trace socket path",
+		},
+		cli.BoolFlag{
+			Name:  "cdi-disabled",
+			Usage: "disables support of the Container Device Interface (CDI)",
+		},
+		cli.StringSliceFlag{
+			Name:  "cdi-spec-dir",
+			Usage: "list of directories to scan for CDI spec files",
+		},
 	)
 	app.Flags = append(app.Flags, appFlags...)
+	app.Flags = append(app.Flags, serviceFlags()...)
 
+	var closers []func(ctx context.Context) error
 	app.Action = func(c *cli.Context) error {
 		// TODO: On Windows this always returns -1. The actual "are you admin" check is very Windows-specific.
 		// See https://github.com/golang/go/issues/28804#issuecomment-505326268 for the "short" version.
 		if os.Geteuid() > 0 {
 			return errors.New("rootless mode requires to be executed as the mapped root in a user namespace; you may use RootlessKit for setting up the namespace")
 		}
-		ctx, cancel := context.WithCancel(appcontext.Context())
-		defer cancel()
+		ctx, cancel := context.WithCancelCause(appcontext.Context())
+		defer func() { cancel(errors.WithStack(context.Canceled)) }()
 
 		cfg, err := config.LoadFile(c.GlobalString("config"))
 		if err != nil {
@@ -210,9 +250,27 @@ func main() {
 			return err
 		}
 
-		logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
+		logFormat := cfg.Log.Format
+		switch logFormat {
+		case "json":
+			logrus.SetFormatter(&logrus.JSONFormatter{})
+		case "text", "":
+			logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
+		default:
+			return errors.Errorf("unsupported log type %q", logFormat)
+		}
+
 		if cfg.Debug {
 			logrus.SetLevel(logrus.DebugLevel)
+		}
+		if cfg.Trace {
+			logrus.SetLevel(logrus.TraceLevel)
+		}
+
+		if sc := cfg.System; sc != nil {
+			if v := sc.PlatformsCacheMaxAge; v != nil {
+				archutil.CacheMaxAge = v.Duration
+			}
 		}
 
 		if cfg.GRPC.DebugAddress != "" {
@@ -221,17 +279,30 @@ func main() {
 			}
 		}
 
-		tp, err := detect.TracerProvider()
+		tp, err := newTracerProvider(ctx)
 		if err != nil {
 			return err
 		}
+		closers = append(closers, tp.Shutdown)
 
-		streamTracer := otelgrpc.StreamServerInterceptor(otelgrpc.WithTracerProvider(tp), otelgrpc.WithPropagators(propagators))
+		mp, err := newMeterProvider(ctx)
+		if err != nil {
+			return err
+		}
+		closers = append(closers, mp.Shutdown)
 
-		unary := grpc_middleware.ChainUnaryServer(unaryInterceptor(ctx, tp), grpcerrors.UnaryServerInterceptor)
-		stream := grpc_middleware.ChainStreamServer(streamTracer, grpcerrors.StreamServerInterceptor)
-
-		opts := []grpc.ServerOption{grpc.UnaryInterceptor(unary), grpc.StreamInterceptor(stream)}
+		statsHandler := tracing.ServerStatsHandler(
+			otelgrpc.WithTracerProvider(tp),
+			otelgrpc.WithMeterProvider(mp),
+			otelgrpc.WithPropagators(propagators),
+		)
+		opts := []grpc.ServerOption{
+			grpc.StatsHandler(statsHandler),
+			grpc.ChainUnaryInterceptor(unaryInterceptor, grpcerrors.UnaryServerInterceptor),
+			grpc.StreamInterceptor(grpcerrors.StreamServerInterceptor),
+			grpc.MaxRecvMsgSize(defaults.DefaultMaxRecvMsgSize),
+			grpc.MaxSendMsgSize(defaults.DefaultMaxSendMsgSize),
+		}
 		server := grpc.NewServer(opts...)
 
 		// relative path does not work with nightlyone/lockfile
@@ -243,6 +314,15 @@ func main() {
 
 		if err := os.MkdirAll(root, 0700); err != nil {
 			return errors.Wrapf(err, "failed to create %s", root)
+		}
+
+		// Stop if we are registering or unregistering against Windows SCM.
+		stop, err := registerUnregisterService(cfg.Root)
+		if err != nil {
+			bklog.L.Fatal(err)
+		}
+		if stop {
+			return nil
 		}
 
 		lockPath := filepath.Join(root, "buildkitd.lock")
@@ -259,12 +339,22 @@ func main() {
 			os.RemoveAll(lockPath)
 		}()
 
-		controller, err := newController(c, &cfg)
+		// listeners have to be initialized before the controller
+		// https://github.com/moby/buildkit/issues/4618
+		listeners, err := newGRPCListeners(cfg.GRPC)
 		if err != nil {
 			return err
 		}
 
+		controller, err := newController(ctx, c, &cfg)
+		if err != nil {
+			return err
+		}
+		defer controller.Close()
+
+		healthv1.RegisterHealthServer(server, health.NewServer())
 		controller.Register(server)
+		reflection.Register(server)
 
 		ents := c.GlobalStringSlice("allow-insecure-entitlement")
 		if len(ents) > 0 {
@@ -276,21 +366,27 @@ func main() {
 				case "network.host":
 					cfg.Entitlements = append(cfg.Entitlements, e)
 				default:
-					return fmt.Errorf("invalid entitlement : %v", e)
+					return errors.Errorf("invalid entitlement : %s", e)
 				}
 			}
 		}
+
+		// Launch as a Windows Service if necessary
+		if err := launchService(server); err != nil {
+			bklog.L.Fatal(err)
+		}
+
 		errCh := make(chan error, 1)
-		if err := serveGRPC(cfg.GRPC, server, errCh); err != nil {
+		if err := serveGRPC(server, listeners, errCh); err != nil {
 			return err
 		}
 
 		select {
 		case serverErr := <-errCh:
 			err = serverErr
-			cancel()
+			cancel(err)
 		case <-ctx.Done():
-			err = ctx.Err()
+			err = context.Cause(ctx)
 		}
 
 		bklog.G(ctx).Infof("stopping server")
@@ -303,8 +399,13 @@ func main() {
 		return err
 	}
 
-	app.After = func(_ *cli.Context) error {
-		return detect.Shutdown(context.TODO())
+	app.After = func(_ *cli.Context) (err error) {
+		for _, c := range closers {
+			if e := c(context.TODO()); e != nil {
+				err = multierror.Append(err, e)
+			}
+		}
+		return err
 	}
 
 	profiler.Attach(app)
@@ -315,37 +416,49 @@ func main() {
 	}
 }
 
-func serveGRPC(cfg config.GRPCConfig, server *grpc.Server, errCh chan error) error {
+func newGRPCListeners(cfg config.GRPCConfig) ([]net.Listener, error) {
 	addrs := cfg.Address
 	if len(addrs) == 0 {
-		return errors.New("--addr cannot be empty")
+		return nil, errors.New("--addr cannot be empty")
 	}
 	tlsConfig, err := serverCredentials(cfg.TLS)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	eg, _ := errgroup.WithContext(context.Background())
+
+	sd := cfg.SecurityDescriptor
+	if sd == "" {
+		sd, err = groupToSecurityDescriptor("")
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	listeners := make([]net.Listener, 0, len(addrs))
 	for _, addr := range addrs {
-		l, err := getListener(addr, *cfg.UID, *cfg.GID, tlsConfig)
+		l, err := getListener(addr, *cfg.UID, *cfg.GID, sd, tlsConfig, true)
 		if err != nil {
 			for _, l := range listeners {
 				l.Close()
 			}
-			return err
+			return listeners, err
 		}
 		listeners = append(listeners, l)
 	}
+	return listeners, nil
+}
 
+func serveGRPC(server *grpc.Server, listeners []net.Listener, errCh chan error) error {
 	if os.Getenv("NOTIFY_SOCKET") != "" {
 		notified, notifyErr := sddaemon.SdNotify(false, sddaemon.SdNotifyReady)
-		logrus.Debugf("SdNotifyReady notified=%v, err=%v", notified, notifyErr)
+		bklog.L.Debugf("SdNotifyReady notified=%v, err=%v", notified, notifyErr)
 	}
+	eg, _ := errgroup.WithContext(context.Background())
 	for _, l := range listeners {
 		func(l net.Listener) {
 			eg.Go(func() error {
 				defer l.Close()
-				logrus.Infof("running server on %s", l.Addr())
+				bklog.L.Infof("running server on %s", l.Addr())
 				return server.Serve(l)
 			})
 		}(l)
@@ -357,7 +470,7 @@ func serveGRPC(cfg config.GRPCConfig, server *grpc.Server, errCh chan error) err
 }
 
 func defaultConfigPath() string {
-	if userns.RunningInUserNS() {
+	if isRootlessConfig() {
 		return filepath.Join(appdefaults.UserConfigDir(), "buildkitd.toml")
 	}
 	return filepath.Join(appdefaults.ConfigDir, "buildkitd.toml")
@@ -370,7 +483,7 @@ func defaultConf() (config.Config, error) {
 		if !errors.As(err, &pe) {
 			return config.Config{}, err
 		}
-		logrus.Warnf("failed to load default config: %v", err)
+		bklog.L.Warnf("failed to load default config: %v", err)
 	}
 	setDefaultConfig(&cfg)
 
@@ -382,10 +495,20 @@ func setDefaultNetworkConfig(nc config.NetworkConfig) config.NetworkConfig {
 		nc.Mode = "auto"
 	}
 	if nc.CNIConfigPath == "" {
-		nc.CNIConfigPath = "/etc/buildkit/cni.json"
+		if isRootlessConfig() {
+			nc.CNIConfigPath = appdefaults.UserCNIConfigPath
+		} else {
+			nc.CNIConfigPath = appdefaults.DefaultCNIConfigPath
+		}
 	}
 	if nc.CNIBinaryPath == "" {
-		nc.CNIBinaryPath = "/opt/cni/bin"
+		nc.CNIBinaryPath = appdefaults.DefaultCNIBinDir
+	}
+	if nc.BridgeName == "" {
+		nc.BridgeName = appdefaults.BridgeName
+	}
+	if nc.BridgeSubnet == "" {
+		nc.BridgeSubnet = appdefaults.BridgeSubnet
 	}
 	return nc
 }
@@ -411,30 +534,52 @@ func setDefaultConfig(cfg *config.Config) {
 	cfg.Workers.OCI.NetworkConfig = setDefaultNetworkConfig(cfg.Workers.OCI.NetworkConfig)
 	cfg.Workers.Containerd.NetworkConfig = setDefaultNetworkConfig(cfg.Workers.Containerd.NetworkConfig)
 
-	if userns.RunningInUserNS() {
-		// if buildkitd is being executed as the mapped-root (not only EUID==0 but also $USER==root)
-		// in a user namespace, we need to enable the rootless mode but
-		// we don't want to honor $HOME for setting up default paths.
-		if u := os.Getenv("USER"); u != "" && u != "root" {
-			if orig.Root == "" {
-				cfg.Root = appdefaults.UserRoot()
-			}
-			if len(orig.GRPC.Address) == 0 {
-				cfg.GRPC.Address = []string{appdefaults.UserAddress()}
-			}
-			appdefaults.EnsureUserAddressDir()
+	if isRootlessConfig() {
+		if orig.Root == "" {
+			cfg.Root = appdefaults.UserRoot()
 		}
+		if len(orig.GRPC.Address) == 0 {
+			cfg.GRPC.Address = []string{appdefaults.UserAddress()}
+		}
+		appdefaults.EnsureUserAddressDir()
 	}
+
+	if cfg.OTEL.SocketPath == "" {
+		cfg.OTEL.SocketPath = appdefaults.TraceSocketPath(isRootlessConfig())
+	}
+
+	if len(cfg.CDI.SpecDirs) == 0 {
+		cfg.CDI.SpecDirs = appdefaults.CDISpecDirs
+	}
+}
+
+// isRootlessConfig is true if we should be using the rootless config
+// defaults instead of the normal defaults.
+func isRootlessConfig() bool {
+	if !userns.RunningInUserNS() {
+		// Default value is false so keep it that way.
+		return false
+	}
+	// if buildkitd is being executed as the mapped-root (not only EUID==0 but also $USER==root)
+	// in a user namespace, we don't want to load the rootless changes in the
+	// configuration.
+	u := os.Getenv("USER")
+	return u != "" && u != "root"
 }
 
 func applyMainFlags(c *cli.Context, cfg *config.Config) error {
 	if c.IsSet("debug") {
 		cfg.Debug = c.Bool("debug")
 	}
+	if c.IsSet("trace") {
+		cfg.Trace = c.Bool("trace")
+	}
 	if c.IsSet("root") {
 		cfg.Root = c.String("root")
 	}
-
+	if c.IsSet("log-format") {
+		cfg.Log.Format = c.String("log-format")
+	}
 	if c.IsSet("addr") || len(cfg.GRPC.Address) == 0 {
 		cfg.GRPC.Address = c.StringSlice("addr")
 	}
@@ -459,11 +604,19 @@ func applyMainFlags(c *cli.Context, cfg *config.Config) error {
 	}
 
 	if group := c.String("group"); group != "" {
-		gid, err := groupToGid(group)
-		if err != nil {
-			return err
+		if runtime.GOOS == "windows" {
+			secDescriptor, err := groupToSecurityDescriptor(group)
+			if err != nil {
+				return err
+			}
+			cfg.GRPC.SecurityDescriptor = secDescriptor
+		} else {
+			gid, err := groupToGid(group)
+			if err != nil {
+				return err
+			}
+			cfg.GRPC.GID = &gid
 		}
-		cfg.GRPC.GID = &gid
 	}
 
 	if tlscert := c.String("tlscert"); tlscert != "" {
@@ -475,6 +628,21 @@ func applyMainFlags(c *cli.Context, cfg *config.Config) error {
 	if tlsca := c.String("tlscacert"); tlsca != "" {
 		cfg.GRPC.TLS.CA = tlsca
 	}
+
+	if c.IsSet("otel-socket-path") {
+		cfg.OTEL.SocketPath = c.String("otel-socket-path")
+	}
+
+	if c.IsSet("cdi-disabled") {
+		cdiDisabled := c.Bool("cdi-disabled")
+		cfg.CDI.Disabled = &cdiDisabled
+	}
+	if c.IsSet("cdi-spec-dir") {
+		cfg.CDI.SpecDirs = c.StringSlice("cdi-spec-dir")
+	}
+
+	applyPlatformFlags(c)
+
 	return nil
 }
 
@@ -511,7 +679,7 @@ func groupToGid(group string) (int, error) {
 	return id, nil
 }
 
-func getListener(addr string, uid, gid int, tlsConfig *tls.Config) (net.Listener, error) {
+func getListener(addr string, uid, gid int, secDescriptor string, tlsConfig *tls.Config, warnTLS bool) (net.Listener, error) {
 	addrSlice := strings.SplitN(addr, "://", 2)
 	if len(addrSlice) < 2 {
 		return nil, errors.Errorf("address %s does not contain proto, you meant unix://%s ?",
@@ -522,7 +690,10 @@ func getListener(addr string, uid, gid int, tlsConfig *tls.Config) (net.Listener
 	switch proto {
 	case "unix", "npipe":
 		if tlsConfig != nil {
-			logrus.Warnf("TLS is disabled for %s", addr)
+			bklog.L.Warnf("TLS is disabled for %s", addr)
+		}
+		if proto == "npipe" {
+			return getLocalListener(listenAddr, secDescriptor)
 		}
 		return sys.GetLocalListener(listenAddr, uid, gid)
 	case "fd":
@@ -534,7 +705,9 @@ func getListener(addr string, uid, gid int, tlsConfig *tls.Config) (net.Listener
 		}
 
 		if tlsConfig == nil {
-			logrus.Warnf("TLS is not enabled for %s. enabling mutual TLS authentication is highly recommended", addr)
+			if warnTLS {
+				bklog.L.Warnf("TLS is not enabled for %s. enabling mutual TLS authentication is highly recommended", addr)
+			}
 			return l, nil
 		}
 		return tls.NewListener(l, tlsConfig), nil
@@ -543,31 +716,19 @@ func getListener(addr string, uid, gid int, tlsConfig *tls.Config) (net.Listener
 	}
 }
 
-func unaryInterceptor(globalCtx context.Context, tp trace.TracerProvider) grpc.UnaryServerInterceptor {
-	withTrace := otelgrpc.UnaryServerInterceptor(otelgrpc.WithTracerProvider(tp), otelgrpc.WithPropagators(propagators))
-
-	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
-		ctx, cancel := context.WithCancel(ctx)
-		defer cancel()
-
-		go func() {
-			select {
-			case <-ctx.Done():
-			case <-globalCtx.Done():
-				cancel()
-			}
-		}()
-
-		if strings.HasSuffix(info.FullMethod, "opentelemetry.proto.collector.trace.v1.TraceService/Export") {
-			return handler(ctx, req)
-		}
-
-		resp, err = withTrace(ctx, req, info, handler)
-		if err != nil {
-			logrus.Errorf("%s returned error: %+v", info.FullMethod, stack.Formatter(err))
-		}
-		return
+func unaryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
+	if strings.HasSuffix(info.FullMethod, "opentelemetry.proto.collector.trace.v1.TraceService/Export") {
+		return handler(ctx, req)
 	}
+
+	resp, err = handler(ctx, req)
+	if err != nil {
+		bklog.G(ctx).Errorf("%s returned error: %v", info.FullMethod, err)
+		if logrus.GetLevel() >= logrus.DebugLevel {
+			fmt.Fprintf(os.Stderr, "%+v", stack.Formatter(grpcerrors.FromGRPC(err)))
+		}
+	}
+	return resp, err
 }
 
 func serverCredentials(cfg config.TLSConfig) (*tls.Config, error) {
@@ -590,6 +751,7 @@ func serverCredentials(cfg config.TLSConfig) (*tls.Config, error) {
 	}
 	tlsConf := &tls.Config{
 		Certificates: []tls.Certificate{certificate},
+		NextProtos:   []string{"h2"},
 	}
 	if caFile != "" {
 		certPool := x509.NewCertPool()
@@ -607,20 +769,26 @@ func serverCredentials(cfg config.TLSConfig) (*tls.Config, error) {
 	return tlsConf, nil
 }
 
-func newController(c *cli.Context, cfg *config.Config) (*control.Controller, error) {
+func newController(ctx context.Context, c *cli.Context, cfg *config.Config) (*control.Controller, error) {
 	sessionManager, err := session.NewManager()
 	if err != nil {
 		return nil, err
 	}
 
-	tc, err := detect.Exporter()
-	if err != nil {
+	tc := make(tracing.MultiSpanExporter, 0, 2)
+	if detect.Recorder != nil {
+		tc = append(tc, detect.Recorder)
+	}
+
+	if exp, err := detect.NewSpanExporter(context.TODO()); err != nil {
 		return nil, err
+	} else if !detect.IsNoneSpanExporter(exp) {
+		tc = append(tc, exp)
 	}
 
 	var traceSocket string
-	if tc != nil {
-		traceSocket = filepath.Join(cfg.Root, "otel-grpc.sock")
+	if len(tc) > 0 {
+		traceSocket = cfg.OTEL.SocketPath
 		if err := runTraceController(traceSocket, tc); err != nil {
 			return nil, err
 		}
@@ -635,10 +803,24 @@ func newController(c *cli.Context, cfg *config.Config) (*control.Controller, err
 		return nil, err
 	}
 	frontends := map[string]frontend.Frontend{}
-	frontends["dockerfile.v0"] = forwarder.NewGatewayForwarder(wc, dockerfile.Build)
-	frontends["gateway.v0"] = gateway.NewGatewayFrontend(wc)
+
+	if cfg.Frontends.Dockerfile.Enabled == nil || *cfg.Frontends.Dockerfile.Enabled {
+		frontends["dockerfile.v0"] = forwarder.NewGatewayForwarder(wc.Infos(), dockerfile.Build)
+	}
+	if cfg.Frontends.Gateway.Enabled == nil || *cfg.Frontends.Gateway.Enabled {
+		gwfe, err := gateway.NewGatewayFrontend(wc.Infos(), cfg.Frontends.Gateway.AllowedRepositories)
+		if err != nil {
+			return nil, err
+		}
+		frontends["gateway.v0"] = gwfe
+	}
 
 	cacheStorage, err := bboltcachestorage.NewStore(filepath.Join(cfg.Root, "cache.db"))
+	if err != nil {
+		return nil, err
+	}
+
+	historyDB, err := boltutil.Open(filepath.Join(cfg.Root, "history.db"), 0600, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -655,11 +837,19 @@ func newController(c *cli.Context, cfg *config.Config) (*control.Controller, err
 		"local":    localremotecache.ResolveCacheExporterFunc(sessionManager),
 		"inline":   inlineremotecache.ResolveCacheExporterFunc(),
 		"gha":      gha.ResolveCacheExporterFunc(),
+		"s3":       s3remotecache.ResolveCacheExporterFunc(),
+		"azblob":   azblob.ResolveCacheExporterFunc(),
 	}
 	remoteCacheImporterFuncs := map[string]remotecache.ResolveCacheImporterFunc{
 		"registry": registryremotecache.ResolveCacheImporterFunc(sessionManager, w.ContentStore(), resolverFn),
 		"local":    localremotecache.ResolveCacheImporterFunc(sessionManager),
 		"gha":      gha.ResolveCacheImporterFunc(),
+		"s3":       s3remotecache.ResolveCacheImporterFunc(),
+		"azblob":   azblob.ResolveCacheImporterFunc(),
+	}
+
+	if cfg.CDI.Disabled == nil || !*cfg.CDI.Disabled {
+		cfg.Entitlements = append(cfg.Entitlements, "device")
 	}
 
 	return control.NewController(control.Opt{
@@ -668,9 +858,16 @@ func newController(c *cli.Context, cfg *config.Config) (*control.Controller, err
 		Frontends:                 frontends,
 		ResolveCacheExporterFuncs: remoteCacheExporterFuncs,
 		ResolveCacheImporterFuncs: remoteCacheImporterFuncs,
-		CacheKeyStorage:           cacheStorage,
+		CacheManager:              solver.NewCacheManager(context.TODO(), "local", cacheStorage, worker.NewCacheResultStorage(wc)),
 		Entitlements:              cfg.Entitlements,
 		TraceCollector:            tc,
+		HistoryDB:                 historyDB,
+		CacheStore:                cacheStorage,
+		LeaseManager:              w.LeaseManager(),
+		ContentStore:              w.ContentStore(),
+		HistoryConfig:             cfg.History,
+		GarbageCollect:            w.GarbageCollect,
+		GracefulStop:              ctx.Done(),
 	})
 }
 
@@ -688,7 +885,7 @@ func newWorkerController(c *cli.Context, wiOpt workerInitializerOpt) (*worker.Co
 		}
 		for _, w := range ws {
 			p := w.Platforms(false)
-			logrus.Infof("found worker %q, labels=%v, platforms=%v", w.ID(), w.Labels(), formatPlatforms(p))
+			bklog.L.Infof("found worker %q, labels=%v, platforms=%v", w.ID(), w.Labels(), formatPlatforms(p))
 			archutil.WarnIfUnsupported(p)
 			if err = wc.Add(w); err != nil {
 				return nil, err
@@ -703,8 +900,8 @@ func newWorkerController(c *cli.Context, wiOpt workerInitializerOpt) (*worker.Co
 	if err != nil {
 		return nil, err
 	}
-	logrus.Infof("found %d workers, default=%q", nWorkers, defaultWorker.ID())
-	logrus.Warn("currently, only the default worker can be used.")
+	bklog.L.Infof("found %d workers, default=%q", nWorkers, defaultWorker.ID())
+	bklog.L.Warn("currently, only the default worker can be used.")
 	return wc, nil
 }
 
@@ -744,19 +941,34 @@ func getGCPolicy(cfg config.GCConfig, root string) []client.PruneInfo {
 	if cfg.GC != nil && !*cfg.GC {
 		return nil
 	}
+	dstat, _ := disk.GetDiskStat(root)
 	if len(cfg.GCPolicy) == 0 {
-		cfg.GCPolicy = config.DefaultGCPolicy(root, cfg.GCKeepStorage)
+		cfg.GCPolicy = config.DefaultGCPolicy(cfg, dstat)
 	}
 	out := make([]client.PruneInfo, 0, len(cfg.GCPolicy))
 	for _, rule := range cfg.GCPolicy {
+		//nolint:staticcheck
+		if rule.ReservedSpace == (config.DiskSpace{}) && rule.KeepBytes != (config.DiskSpace{}) {
+			rule.ReservedSpace = rule.KeepBytes
+		}
 		out = append(out, client.PruneInfo{
-			Filter:       rule.Filters,
-			All:          rule.All,
-			KeepBytes:    rule.KeepBytes,
-			KeepDuration: time.Duration(rule.KeepDuration) * time.Second,
+			Filter:        rule.Filters,
+			All:           rule.All,
+			KeepDuration:  rule.KeepDuration.Duration,
+			ReservedSpace: rule.ReservedSpace.AsBytes(dstat),
+			MaxUsedSpace:  rule.MaxUsedSpace.AsBytes(dstat),
+			MinFreeSpace:  rule.MinFreeSpace.AsBytes(dstat),
 		})
 	}
 	return out
+}
+
+func getBuildkitVersion() client.BuildkitVersion {
+	return client.BuildkitVersion{
+		Package:  version.Package,
+		Version:  version.Version,
+		Revision: version.Revision,
+	}
 }
 
 func getDNSConfig(cfg *config.DNSConfig) *oci.DNSConfig {
@@ -773,7 +985,7 @@ func getDNSConfig(cfg *config.DNSConfig) *oci.DNSConfig {
 
 // parseBoolOrAuto returns (nil, nil) if s is "auto"
 func parseBoolOrAuto(s string) (*bool, error) {
-	if s == "" || strings.ToLower(s) == "auto" {
+	if s == "" || strings.EqualFold(s, "auto") {
 		return nil, nil
 	}
 	b, err := strconv.ParseBool(s)
@@ -783,28 +995,89 @@ func parseBoolOrAuto(s string) (*bool, error) {
 func runTraceController(p string, exp sdktrace.SpanExporter) error {
 	server := grpc.NewServer()
 	tracev1.RegisterTraceServiceServer(server, &traceCollector{exporter: exp})
-	uid := os.Getuid()
-	l, err := sys.GetLocalListener(p, uid, uid)
+	l, err := getLocalListener(p, "")
 	if err != nil {
-		return err
-	}
-	if err := os.Chmod(p, 0666); err != nil {
-		l.Close()
-		return err
+		return errors.Wrap(err, "creating trace controller listener")
 	}
 	go server.Serve(l)
 	return nil
 }
 
 type traceCollector struct {
-	*tracev1.UnimplementedTraceServiceServer
+	tracev1.UnimplementedTraceServiceServer
 	exporter sdktrace.SpanExporter
 }
 
 func (t *traceCollector) Export(ctx context.Context, req *tracev1.ExportTraceServiceRequest) (*tracev1.ExportTraceServiceResponse, error) {
-	err := t.exporter.ExportSpans(ctx, transform.Spans(req.GetResourceSpans()))
-	if err != nil {
+	if err := t.exporter.ExportSpans(ctx, transform.Spans(req.GetResourceSpans())); err != nil {
 		return nil, err
 	}
 	return &tracev1.ExportTraceServiceResponse{}, nil
+}
+
+func newTracerProvider(ctx context.Context) (*sdktrace.TracerProvider, error) {
+	opts := []sdktrace.TracerProviderOption{
+		sdktrace.WithResource(detect.Resource()),
+		sdktrace.WithSyncer(detect.Recorder),
+	}
+
+	if exp, err := detect.NewSpanExporter(ctx); err != nil {
+		return nil, err
+	} else if !detect.IsNoneSpanExporter(exp) {
+		opts = append(opts, sdktrace.WithBatcher(exp))
+	}
+	return sdktrace.NewTracerProvider(opts...), nil
+}
+
+func newMeterProvider(ctx context.Context) (*sdkmetric.MeterProvider, error) {
+	opts := []sdkmetric.Option{
+		sdkmetric.WithResource(detect.Resource()),
+	}
+
+	if r, err := prometheus.New(); err != nil {
+		// Log the error but do not fail if we could not configure the prometheus metrics.
+		bklog.G(context.Background()).
+			WithError(err).
+			Error("failed prometheus metrics configuration")
+	} else {
+		opts = append(opts, sdkmetric.WithReader(r))
+	}
+
+	if exp, err := detect.NewMetricExporter(ctx); err != nil {
+		return nil, err
+	} else if !detect.IsNoneMetricExporter(exp) {
+		r := sdkmetric.NewPeriodicReader(exp)
+		opts = append(opts, sdkmetric.WithReader(r))
+	}
+	return sdkmetric.NewMeterProvider(opts...), nil
+}
+
+func getCDIManager(cfg config.CDIConfig) (*cdidevices.Manager, error) {
+	if cfg.Disabled != nil && *cfg.Disabled {
+		return nil, nil
+	}
+	if len(cfg.SpecDirs) == 0 {
+		return nil, errors.New("no CDI specification directories specified")
+	}
+	cdiCache, err := func() (*cdi.Cache, error) {
+		cdiCache, err := cdi.NewCache(cdi.WithSpecDirs(cfg.SpecDirs...))
+		if err != nil {
+			return nil, err
+		}
+		if err := cdiCache.Refresh(); err != nil {
+			return nil, err
+		}
+		if errs := cdiCache.GetErrors(); len(errs) > 0 {
+			for dir, errs := range errs {
+				for _, err := range errs {
+					bklog.L.Warnf("CDI setup error %v: %+v", dir, err)
+				}
+			}
+		}
+		return cdiCache, nil
+	}()
+	if err != nil {
+		return nil, errors.Wrapf(err, "CDI registry initialization failure")
+	}
+	return cdidevices.NewManager(cdiCache, cfg.AutoAllowed), nil
 }

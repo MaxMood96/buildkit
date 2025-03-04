@@ -1,3 +1,4 @@
+//go:build !windows
 // +build !windows
 
 package fsutil
@@ -51,7 +52,7 @@ func setUnixOpt(fi os.FileInfo, stat *types.Stat, path string, seenFiles map[uin
 			if s.Nlink > 1 {
 				if oldpath, ok := seenFiles[ino]; ok {
 					stat.Linkname = oldpath
-					stat.Size_ = 0
+					stat.Size = 0
 					linked = true
 				}
 			}

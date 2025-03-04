@@ -153,8 +153,10 @@ made through a pull request.
 			"akihirosuda",
 			"coryb",
 			"crazy-max",
+			"gabriel-samfira",
 			"hinshun",
 			"ijc",
+			"jedevc",
 			"ktock",
 			"sipsma",
 			"tiborvass",
@@ -175,6 +177,7 @@ made through a pull request.
 
 		people = [
 			"thajeztah",
+			"thompson-shaun"
 		]
 
 [people]
@@ -198,6 +201,11 @@ made through a pull request.
 	Email = "contact@crazymax.dev"
 	GitHub = "crazy-max"
 
+	[people.gabriel-samfira]
+	Name = "Gabriel Adrian Samfira"
+	Email = "gsamfira@cloudbasesolutions.com"
+	GitHub = "gabriel-samfira"
+
 	[people.hinshun]
 	Name = "Edgar Lee"
 	Email = "edgarhinshunlee@gmail.com"
@@ -207,6 +215,11 @@ made through a pull request.
 	Name = "Ian Campbell"
 	Email = "ian.campbell@docker.com"
 	GitHub = "ijc"
+
+	[people.jedevc]
+	Name = "Justin Chadwell"
+	Email = "me@jedevc.com"
+	GitHub = "jedevc"
 
 	[people.ktock]
 	Name = "Kohei Tokunaga"
@@ -222,6 +235,11 @@ made through a pull request.
 	Name = "Sebastiaan van Stijn"
 	Email = "github@gone.nl"
 	GitHub = "thaJeztah"
+
+	[people.thompson-shaun]
+	Name = "Shaun Thompson"
+	Email = "shaun.thompson@docker.com"
+	GitHub = "thompson-shaun"
 
 	[people.tiborvass]
 	Name = "Tibor Vass"

@@ -9,6 +9,7 @@ import (
 )
 
 const (
+	ENODATA = Status(syscall.ENODATA)
 	ENOATTR = Status(syscall.ENOATTR) // ENOATTR is not defined for all GOOS.
 
 	// EREMOTEIO is not supported on Darwin.
@@ -30,8 +31,10 @@ type Attr struct {
 	Mode        uint32
 	Nlink       uint32
 	Owner
-	Rdev   uint32
-	Flags_ uint32 //  OS X
+	Rdev    uint32
+	Flags_  uint32 //  OS X
+	Blksize uint32
+	Padding uint32
 }
 
 const (
@@ -59,56 +62,6 @@ const (
 	FOPEN_PURGE_UBC  = (1 << 31)
 )
 
-// compat with linux.
-const (
-	// Mask for GetAttrIn.Flags. If set, GetAttrIn has a file handle set.
-	FUSE_GETATTR_FH = (1 << 0)
-)
-
-type GetAttrIn struct {
-	InHeader
-}
-
-func (g *GetAttrIn) Flags() uint32 {
-	return 0
-}
-
-func (g *GetAttrIn) Fh() uint64 {
-	return 0
-}
-
-// Uses OpenIn struct for create.
-type CreateIn struct {
-	InHeader
-
-	Flags uint32
-	Mode  uint32
-}
-
-type MknodIn struct {
-	InHeader
-
-	Mode uint32
-	Rdev uint32
-}
-
-type ReadIn struct {
-	InHeader
-
-	Fh        uint64
-	Offset    uint64
-	Size      uint32
-	ReadFlags uint32
-}
-
-type WriteIn struct {
-	InHeader
-	Fh         uint64
-	Offset     uint64
-	Size       uint32
-	WriteFlags uint32
-}
-
 type SetXAttrIn struct {
 	InHeader
 	Size     uint32
@@ -126,9 +79,17 @@ type GetXAttrIn struct {
 }
 
 const (
+	CAP_NODE_RWLOCK      = (1 << 24)
+	CAP_RENAME_SWAP      = (1 << 25)
+	CAP_RENAME_EXCL      = (1 << 26)
+	CAP_ALLOCATE         = (1 << 27)
+	CAP_EXCHANGE_DATA    = (1 << 28)
 	CAP_CASE_INSENSITIVE = (1 << 29)
 	CAP_VOL_RENAME       = (1 << 30)
 	CAP_XTIMES           = (1 << 31)
+
+	// CAP_EXPLICIT_INVAL_DATA is not supported on Darwin.
+	CAP_EXPLICIT_INVAL_DATA = 0x0
 )
 
 type GetxtimesOut struct {
@@ -163,4 +124,8 @@ func (s *StatfsOut) FromStatfsT(statfs *syscall.Statfs_t) {
 		s.Bfree /= adj
 		s.Bavail /= adj
 	}
+}
+
+func (o *InitOut) setFlags(flags uint64) {
+	o.Flags = uint32(flags)
 }

@@ -4,20 +4,20 @@ import (
 	"context"
 	"sync"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/containerd/reference"
-	"github.com/containerd/containerd/remotes"
-	"github.com/containerd/containerd/remotes/docker"
-	"github.com/containerd/containerd/remotes/docker/schema1"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/core/remotes/docker/schema1" //nolint:staticcheck // SA1019 deprecated
+	"github.com/containerd/containerd/v2/pkg/labels"
+	"github.com/containerd/containerd/v2/pkg/reference"
+	"github.com/containerd/platforms"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/flightcontrol"
 	"github.com/moby/buildkit/util/imageutil"
 	"github.com/moby/buildkit/util/progress/logs"
 	"github.com/moby/buildkit/util/pull/pullprogress"
-	"github.com/moby/buildkit/util/resolver"
 	"github.com/moby/buildkit/util/resolver/limited"
 	"github.com/moby/buildkit/util/resolver/retryhandler"
 	digest "github.com/opencontainers/go-digest"
@@ -25,13 +25,15 @@ import (
 	"github.com/pkg/errors"
 )
 
+type SessionResolver func(g session.Group) remotes.Resolver
+
 type Puller struct {
 	ContentStore content.Store
-	Resolver     *resolver.Resolver
+	Resolver     remotes.Resolver
 	Src          reference.Spec
 	Platform     ocispecs.Platform
 
-	g           flightcontrol.Group
+	g           flightcontrol.Group[struct{}]
 	resolveErr  error
 	resolveDone bool
 	desc        ocispecs.Descriptor
@@ -53,9 +55,9 @@ type PulledManifests struct {
 }
 
 func (p *Puller) resolve(ctx context.Context, resolver remotes.Resolver) error {
-	_, err := p.g.Do(ctx, "", func(ctx context.Context) (_ interface{}, err error) {
+	_, err := p.g.Do(ctx, "", func(ctx context.Context) (_ struct{}, err error) {
 		if p.resolveErr != nil || p.resolveDone {
-			return nil, p.resolveErr
+			return struct{}{}, p.resolveErr
 		}
 		defer func() {
 			if !errors.Is(err, context.Canceled) {
@@ -67,12 +69,12 @@ func (p *Puller) resolve(ctx context.Context, resolver remotes.Resolver) error {
 		}
 		ref, desc, err := resolver.Resolve(ctx, p.Src.String())
 		if err != nil {
-			return nil, err
+			return struct{}{}, err
 		}
 		p.desc = desc
 		p.ref = ref
 		p.resolveDone = true
-		return nil, nil
+		return struct{}{}, nil
 	})
 	return err
 }
@@ -90,6 +92,11 @@ func (p *Puller) tryLocalResolve(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	if ok, err := contentutil.HasSource(info, p.Src); err != nil || !ok {
+		return errors.Errorf("no matching source")
+	}
+
 	desc.Size = info.Size
 	p.ref = p.Src.String()
 	ra, err := p.ContentStore.ReaderAt(ctx, desc)
@@ -105,7 +112,7 @@ func (p *Puller) tryLocalResolve(ctx context.Context) error {
 	return nil
 }
 
-func (p *Puller) PullManifests(ctx context.Context) (*PulledManifests, error) {
+func (p *Puller) PullManifests(ctx context.Context, getResolver SessionResolver) (*PulledManifests, error) {
 	err := p.resolve(ctx, p.Resolver)
 	if err != nil {
 		return nil, err
@@ -130,10 +137,13 @@ func (p *Puller) PullManifests(ctx context.Context) (*PulledManifests, error) {
 	if p.desc.MediaType == images.MediaTypeDockerSchema1Manifest {
 		// schema1 images are not lazy at this time, the converter will pull the whole image
 		// including layer blobs
-		schema1Converter = schema1.NewConverter(p.ContentStore, &pullprogress.FetcherWithProgress{
+		schema1Converter, err = schema1.NewConverter(p.ContentStore, &pullprogress.FetcherWithProgress{
 			Fetcher: fetcher,
 			Manager: p.ContentStore,
 		})
+		if err != nil {
+			return nil, err
+		}
 		handlers = append(handlers, schema1Converter)
 	} else {
 		// Get all the children for a descriptor
@@ -196,7 +206,7 @@ func (p *Puller) PullManifests(ctx context.Context) (*PulledManifests, error) {
 		Nonlayers:        p.nonlayers,
 		Descriptors:      p.layers,
 		Provider: func(g session.Group) content.Provider {
-			return &provider{puller: p, resolver: p.Resolver.WithSession(g)}
+			return &provider{puller: p, resolver: getResolver(g)}
 		},
 	}, nil
 }
@@ -227,15 +237,15 @@ func filterLayerBlobs(metadata map[digest.Digest]ocispecs.Descriptor, mu sync.Lo
 		switch desc.MediaType {
 		case
 			ocispecs.MediaTypeImageLayer,
-			ocispecs.MediaTypeImageLayerNonDistributable,
+			ocispecs.MediaTypeImageLayerNonDistributable, //nolint:staticcheck // ignore SA1019: Non-distributable layers are deprecated, and not recommended for future use.
 			images.MediaTypeDockerSchema2Layer,
 			images.MediaTypeDockerSchema2LayerForeign,
 			ocispecs.MediaTypeImageLayerGzip,
 			images.MediaTypeDockerSchema2LayerGzip,
-			ocispecs.MediaTypeImageLayerNonDistributableGzip,
+			ocispecs.MediaTypeImageLayerNonDistributableGzip, //nolint:staticcheck // ignore SA1019: Non-distributable layers are deprecated, and not recommended for future use.
 			images.MediaTypeDockerSchema2LayerForeignGzip,
 			ocispecs.MediaTypeImageLayerZstd,
-			ocispecs.MediaTypeImageLayerNonDistributableZstd:
+			ocispecs.MediaTypeImageLayerNonDistributableZstd: //nolint:staticcheck // ignore SA1019: Non-distributable layers are deprecated, and not recommended for future use.
 			return nil, images.ErrSkipDesc
 		default:
 			if metadata != nil {
@@ -267,7 +277,7 @@ func getLayers(ctx context.Context, provider content.Provider, desc ocispecs.Des
 		if desc.Annotations == nil {
 			desc.Annotations = map[string]string{}
 		}
-		desc.Annotations["containerd.io/uncompressed"] = diffIDs[i].String()
+		desc.Annotations[labels.LabelUncompressed] = diffIDs[i].String()
 		layers[i] = desc
 	}
 	return layers, nil

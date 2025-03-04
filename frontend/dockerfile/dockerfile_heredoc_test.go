@@ -8,10 +8,12 @@ import (
 
 	"github.com/containerd/continuity/fs/fstest"
 	"github.com/moby/buildkit/client"
-	"github.com/moby/buildkit/frontend/dockerfile/builder"
+	"github.com/moby/buildkit/frontend/dockerui"
 	"github.com/moby/buildkit/util/testutil/integration"
+	"github.com/moby/buildkit/util/testutil/workers"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
+	"github.com/tonistiigi/fsutil"
 )
 
 var hdTests = integration.TestFuncs(
@@ -31,6 +33,7 @@ func init() {
 }
 
 func testCopyHeredoc(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -67,19 +70,16 @@ FROM scratch
 COPY --from=build /dest /
 `)
 
-	dir, err := tmpdir(
+	dir := integration.Tmpdir(
+		t,
 		fstest.CreateFile("Dockerfile", []byte(dockerfile), 0600),
 	)
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	destDir, err := os.MkdirTemp("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
+	destDir := t.TempDir()
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
@@ -88,9 +88,9 @@ COPY --from=build /dest /
 				OutputDir: destDir,
 			},
 		},
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)
@@ -110,6 +110,7 @@ COPY --from=build /dest /
 }
 
 func testCopyHeredocSpecialSymbols(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -140,19 +141,16 @@ COPY <<"EOF" rawslashfile3
 EOF
 `)
 
-	dir, err := tmpdir(
+	dir := integration.Tmpdir(
+		t,
 		fstest.CreateFile("Dockerfile", []byte(dockerfile), 0600),
 	)
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	destDir, err := os.MkdirTemp("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
+	destDir := t.TempDir()
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
@@ -161,9 +159,9 @@ EOF
 				OutputDir: destDir,
 			},
 		},
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)
@@ -198,6 +196,7 @@ EOF
 }
 
 func testRunBasicHeredoc(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -212,19 +211,16 @@ FROM scratch
 COPY --from=build /dest /dest
 `)
 
-	dir, err := tmpdir(
+	dir := integration.Tmpdir(
+		t,
 		fstest.CreateFile("Dockerfile", []byte(dockerfile), 0600),
 	)
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	destDir, err := os.MkdirTemp("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
+	destDir := t.TempDir()
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
@@ -233,9 +229,9 @@ COPY --from=build /dest /dest
 				OutputDir: destDir,
 			},
 		},
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)
@@ -246,6 +242,7 @@ COPY --from=build /dest /dest
 }
 
 func testRunFakeHeredoc(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -262,19 +259,16 @@ FROM scratch
 COPY --from=build /dest /dest
 `)
 
-	dir, err := tmpdir(
+	dir := integration.Tmpdir(
+		t,
 		fstest.CreateFile("Dockerfile", []byte(dockerfile), 0600),
 	)
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	destDir, err := os.MkdirTemp("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
+	destDir := t.TempDir()
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
@@ -283,9 +277,9 @@ COPY --from=build /dest /dest
 				OutputDir: destDir,
 			},
 		},
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)
@@ -296,6 +290,7 @@ COPY --from=build /dest /dest
 }
 
 func testRunShebangHeredoc(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -313,19 +308,16 @@ FROM scratch
 COPY --from=build /dest /dest
 `)
 
-	dir, err := tmpdir(
+	dir := integration.Tmpdir(
+		t,
 		fstest.CreateFile("Dockerfile", []byte(dockerfile), 0600),
 	)
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	destDir, err := os.MkdirTemp("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
+	destDir := t.TempDir()
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
@@ -334,9 +326,9 @@ COPY --from=build /dest /dest
 				OutputDir: destDir,
 			},
 		},
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)
@@ -347,6 +339,7 @@ COPY --from=build /dest /dest
 }
 
 func testRunComplexHeredoc(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -378,19 +371,16 @@ FROM scratch
 COPY --from=build /dest /
 `)
 
-	dir, err := tmpdir(
+	dir := integration.Tmpdir(
+		t,
 		fstest.CreateFile("Dockerfile", []byte(dockerfile), 0600),
 	)
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	destDir, err := os.MkdirTemp("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
+	destDir := t.TempDir()
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
@@ -399,9 +389,9 @@ COPY --from=build /dest /
 				OutputDir: destDir,
 			},
 		},
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)
@@ -421,6 +411,7 @@ COPY --from=build /dest /
 }
 
 func testHeredocIndent(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -470,19 +461,16 @@ FROM scratch
 COPY --from=build /dest /
 `)
 
-	dir, err := tmpdir(
+	dir := integration.Tmpdir(
+		t,
 		fstest.CreateFile("Dockerfile", []byte(dockerfile), 0600),
 	)
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	destDir, err := os.MkdirTemp("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
+	destDir := t.TempDir()
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
@@ -491,9 +479,9 @@ COPY --from=build /dest /
 				OutputDir: destDir,
 			},
 		},
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)
@@ -517,6 +505,7 @@ COPY --from=build /dest /
 }
 
 func testHeredocVarSubstitution(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -566,19 +555,16 @@ FROM scratch
 COPY --from=build /dest /
 `)
 
-	dir, err := tmpdir(
+	dir := integration.Tmpdir(
+		t,
 		fstest.CreateFile("Dockerfile", []byte(dockerfile), 0600),
 	)
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	destDir, err := os.MkdirTemp("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
+	destDir := t.TempDir()
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
@@ -587,9 +573,9 @@ COPY --from=build /dest /
 				OutputDir: destDir,
 			},
 		},
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)
@@ -616,7 +602,8 @@ COPY --from=build /dest /
 }
 
 func testOnBuildHeredoc(t *testing.T, sb integration.Sandbox) {
-	integration.SkipIfDockerd(t, sb, "image export")
+	integration.SkipOnPlatform(t, "windows")
+	workers.CheckFeatureCompat(t, sb, workers.FeatureDirectPush)
 	f := getFrontend(t, sb)
 
 	registry, err := sb.NewRegistry()
@@ -632,11 +619,10 @@ echo "hello world" >> /dest
 EOF
 `)
 
-	dir, err := tmpdir(
+	dir := integration.Tmpdir(
+		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
@@ -653,22 +639,12 @@ EOF
 				},
 			},
 		},
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)
-
-	dockerfile = []byte(fmt.Sprintf(`
-	FROM %s 
-	`, target))
-
-	dir, err = tmpdir(
-		fstest.CreateFile("Dockerfile", dockerfile, 0600),
-	)
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
 	dockerfile = []byte(fmt.Sprintf(`
 	FROM %s AS base
@@ -676,15 +652,12 @@ EOF
 	COPY --from=base /dest /dest
 	`, target))
 
-	dir, err = tmpdir(
+	dir = integration.Tmpdir(
+		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
-	destDir, err := os.MkdirTemp("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
+	destDir := t.TempDir()
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
 		Exports: []client.ExportEntry{
@@ -693,9 +666,9 @@ EOF
 				OutputDir: destDir,
 			},
 		},
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)

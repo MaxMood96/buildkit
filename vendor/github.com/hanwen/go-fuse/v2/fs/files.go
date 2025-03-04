@@ -7,12 +7,10 @@ package fs
 import (
 	"context"
 	"sync"
-
-	//	"time"
-
 	"syscall"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/hanwen/go-fuse/v2/internal/fallocate"
 	"golang.org/x/sys/unix"
 )
 
@@ -42,6 +40,14 @@ var _ = (FileFlusher)((*loopbackFile)(nil))
 var _ = (FileFsyncer)((*loopbackFile)(nil))
 var _ = (FileSetattrer)((*loopbackFile)(nil))
 var _ = (FileAllocater)((*loopbackFile)(nil))
+var _ = (FilePassthroughFder)((*loopbackFile)(nil))
+
+func (f *loopbackFile) PassthroughFd() (int, bool) {
+	// This Fd is not accessed concurrently, but lock anyway for uniformity.
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fd, true
+}
 
 func (f *loopbackFile) Read(ctx context.Context, buf []byte, off int64) (res fuse.ReadResult, errno syscall.Errno) {
 	f.mu.Lock()
@@ -155,13 +161,26 @@ func (f *loopbackFile) Setattr(ctx context.Context, in *fuse.SetAttrIn, out *fus
 	return f.Getattr(ctx, out)
 }
 
-func (f *loopbackFile) setAttr(ctx context.Context, in *fuse.SetAttrIn) syscall.Errno {
+func (f *loopbackFile) fchmod(mode uint32) syscall.Errno {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return ToErrno(syscall.Fchmod(f.fd, mode))
+}
+
+func (f *loopbackFile) fchown(uid, gid int) syscall.Errno {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return ToErrno(syscall.Fchown(f.fd, uid, gid))
+}
+
+func (f *loopbackFile) ftruncate(sz uint64) syscall.Errno {
+	return ToErrno(syscall.Ftruncate(f.fd, int64(sz)))
+}
+
+func (f *loopbackFile) setAttr(ctx context.Context, in *fuse.SetAttrIn) syscall.Errno {
 	var errno syscall.Errno
 	if mode, ok := in.GetMode(); ok {
-		errno = ToErrno(syscall.Fchmod(f.fd, mode))
-		if errno != 0 {
+		if errno := f.fchmod(mode); errno != 0 {
 			return errno
 		}
 	}
@@ -178,8 +197,7 @@ func (f *loopbackFile) setAttr(ctx context.Context, in *fuse.SetAttrIn) syscall.
 		if gOk {
 			gid = int(gid32)
 		}
-		errno = ToErrno(syscall.Fchown(f.fd, uid, gid))
-		if errno != 0 {
+		if errno := f.fchown(uid, gid); errno != 0 {
 			return errno
 		}
 	}
@@ -203,8 +221,7 @@ func (f *loopbackFile) setAttr(ctx context.Context, in *fuse.SetAttrIn) syscall.
 	}
 
 	if sz, ok := in.GetSize(); ok {
-		errno = ToErrno(syscall.Ftruncate(f.fd, int64(sz)))
-		if errno != 0 {
+		if errno := f.ftruncate(sz); errno != 0 {
 			return errno
 		}
 	}
@@ -229,4 +246,14 @@ func (f *loopbackFile) Lseek(ctx context.Context, off uint64, whence uint32) (ui
 	defer f.mu.Unlock()
 	n, err := unix.Seek(f.fd, int64(off), int(whence))
 	return uint64(n), ToErrno(err)
+}
+
+func (f *loopbackFile) Allocate(ctx context.Context, off uint64, sz uint64, mode uint32) syscall.Errno {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	err := fallocate.Fallocate(f.fd, mode, int64(off), int64(sz))
+	if err != nil {
+		return ToErrno(err)
+	}
+	return OK
 }

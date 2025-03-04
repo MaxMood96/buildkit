@@ -1,20 +1,21 @@
 package solver
 
 import (
-	"os"
 	"testing"
 	"time"
 
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/util/testutil/integration"
+	"github.com/moby/buildkit/util/testutil/workers"
 	"github.com/stretchr/testify/require"
+	"github.com/tonistiigi/fsutil"
 	"golang.org/x/sync/errgroup"
 )
 
 func init() {
-	integration.InitOCIWorker()
-	integration.InitContainerdWorker()
+	workers.InitOCIWorker()
+	workers.InitContainerdWorker()
 }
 
 func TestJobsIntegration(t *testing.T) {
@@ -31,6 +32,7 @@ func TestJobsIntegration(t *testing.T) {
 }
 
 func testParallelism(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	ctx := sb.Context()
 
 	c, err := client.New(ctx, sb.Address())
@@ -61,11 +63,8 @@ func testParallelism(t *testing.T, sb integration.Sandbox) {
 
 	timeStart := time.Now()
 	eg, egCtx := errgroup.WithContext(ctx)
-	tmpDir, err := os.MkdirTemp("", "solver-jobs-test-")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
 	solveOpt := client.SolveOpt{
-		LocalDirs: map[string]string{"cache": tmpDir},
+		LocalMounts: map[string]fsutil.FS{"cache": integration.Tmpdir(t)},
 	}
 	eg.Go(func() error {
 		_, err := c.Solve(egCtx, d1, solveOpt, nil)

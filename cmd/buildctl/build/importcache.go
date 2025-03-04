@@ -1,12 +1,12 @@
 package build
 
 import (
-	"encoding/csv"
 	"strings"
 
 	"github.com/moby/buildkit/client"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
+	"github.com/tonistiigi/go-csvvalue"
 )
 
 func parseImportCacheCSV(s string) (client.CacheOptionsEntry, error) {
@@ -14,18 +14,16 @@ func parseImportCacheCSV(s string) (client.CacheOptionsEntry, error) {
 		Type:  "",
 		Attrs: map[string]string{},
 	}
-	csvReader := csv.NewReader(strings.NewReader(s))
-	fields, err := csvReader.Read()
+	fields, err := csvvalue.Fields(s, nil)
 	if err != nil {
 		return im, err
 	}
 	for _, field := range fields {
-		parts := strings.SplitN(field, "=", 2)
-		if len(parts) != 2 {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok {
 			return im, errors.Errorf("invalid value %s", field)
 		}
-		key := strings.ToLower(parts[0])
-		value := parts[1]
+		key = strings.ToLower(key)
 		switch key {
 		case "type":
 			im.Type = value
@@ -48,7 +46,8 @@ func ParseImportCache(importCaches []string) ([]client.CacheOptionsEntry, error)
 	for _, importCache := range importCaches {
 		legacy := !strings.Contains(importCache, "type=")
 		if legacy {
-			logrus.Warn("--import-cache <ref> is deprecated. Please use --import-cache type=registry,ref=<ref>,<opt>=<optval>[,<opt>=<optval>] instead.")
+			// Deprecated since BuildKit v0.4.0, but no plan to remove: https://github.com/moby/buildkit/pull/2783#issuecomment-1093449772
+			bklog.L.Warn("--import-cache <ref> is deprecated. Please use --import-cache type=registry,ref=<ref>,<opt>=<optval>[,<opt>=<optval>] instead.")
 			imports = append(imports, client.CacheOptionsEntry{
 				Type:  "registry",
 				Attrs: map[string]string{"ref": importCache},

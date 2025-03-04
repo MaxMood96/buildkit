@@ -21,8 +21,8 @@ type buildOpt struct {
 func main() {
 	var opt buildOpt
 	flag.BoolVar(&opt.withContainerd, "with-containerd", true, "enable containerd worker")
-	flag.StringVar(&opt.containerd, "containerd", "v1.5.9", "containerd version")
-	flag.StringVar(&opt.runc, "runc", "v1.1.0", "runc version")
+	flag.StringVar(&opt.containerd, "containerd", "v1.7.2", "containerd version")
+	flag.StringVar(&opt.runc, "runc", "v1.1.7", "runc version")
 	flag.StringVar(&opt.buildkit, "buildkit", "master", "buildkit version")
 	flag.StringVar(&opt.installPrefix, "prefix", "/usr/local/bin", "path under which binaries should be installed")
 	flag.Parse()
@@ -37,7 +37,7 @@ func main() {
 }
 
 func goBuildBase() llb.State {
-	goAlpine := llb.Image("docker.io/library/golang:1.17-alpine")
+	goAlpine := llb.Image("docker.io/library/golang:1.23-alpine")
 	return goAlpine.
 		AddEnv("PATH", "/usr/local/go/bin:"+system.DefaultPathEnvUnix).
 		AddEnv("GOPATH", "/go").
@@ -65,7 +65,7 @@ func runc(version string) llb.State {
 }
 
 func containerd(version string) llb.State {
-	repo := "github.com/containerd/containerd"
+	repo := "github.com/containerd/containerd/v2/client"
 	src := llb.Git(repo, version, llb.KeepGitDir())
 	if version == "local" {
 		src = llb.Local("containerd-src")
@@ -86,21 +86,14 @@ func buildkit(opt buildOpt) llb.State {
 	}
 	run := goRepo(goBuildBase(), repo, src)
 
-	buildkitdOCIWorkerOnly := prefixed(
-		run(llb.Shlex("go build -o /out/buildkitd.oci_only -tags no_containerd_worker ./cmd/buildkitd")),
-		opt.installPrefix,
-	)
-
 	buildkitd := prefixed(run(llb.Shlex("go build -o /out/buildkitd ./cmd/buildkitd")), opt.installPrefix)
 
 	buildctl := prefixed(run(llb.Shlex("go build -o /out/buildctl ./cmd/buildctl")), opt.installPrefix)
 
-	inputs := []llb.State{buildctl, prefixed(runc(opt.runc), opt.installPrefix)}
+	inputs := []llb.State{buildctl, buildkitd, prefixed(runc(opt.runc), opt.installPrefix)}
 
 	if opt.withContainerd {
 		inputs = append(inputs, prefixed(containerd(opt.containerd), opt.installPrefix), buildkitd)
-	} else {
-		inputs = append(inputs, buildkitdOCIWorkerOnly)
 	}
 	return llb.Merge(inputs)
 }

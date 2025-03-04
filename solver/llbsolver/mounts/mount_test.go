@@ -8,15 +8,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/content/local"
-	"github.com/containerd/containerd/diff/apply"
-	"github.com/containerd/containerd/diff/walking"
-	"github.com/containerd/containerd/leases"
-	ctdmetadata "github.com/containerd/containerd/metadata"
-	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/snapshots"
-	"github.com/containerd/containerd/snapshots/native"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/diff/apply"
+	"github.com/containerd/containerd/v2/core/leases"
+	ctdmetadata "github.com/containerd/containerd/v2/core/metadata"
+	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/plugins/content/local"
+	"github.com/containerd/containerd/v2/plugins/diff/walking"
+	"github.com/containerd/containerd/v2/plugins/snapshots/native"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/snapshot"
@@ -25,6 +25,7 @@ import (
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/winlayers"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/sync/errgroup"
@@ -42,41 +43,19 @@ type cmOut struct {
 	cs      content.Store
 }
 
-func newCacheManager(ctx context.Context, opt cmOpt) (co *cmOut, cleanup func() error, err error) {
+func newCacheManager(ctx context.Context, t *testing.T, opt cmOpt) (co *cmOut, err error) {
 	ns, ok := namespaces.Namespace(ctx)
 	if !ok {
-		return nil, nil, errors.Errorf("namespace required for test")
+		return nil, errors.Errorf("namespace required for test")
 	}
 
 	if opt.snapshotterName == "" {
 		opt.snapshotterName = "native"
 	}
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	if err != nil {
-		return nil, nil, err
-	}
+	tmpdir := t.TempDir()
 
-	defers := make([]func() error, 0)
-	cleanup = func() error {
-		var err error
-		for i := range defers {
-			if err1 := defers[len(defers)-1-i](); err1 != nil && err == nil {
-				err = err1
-			}
-		}
-		return err
-	}
-	defer func() {
-		if err != nil {
-			cleanup()
-		}
-	}()
-	if opt.tmpdir == "" {
-		defers = append(defers, func() error {
-			return os.RemoveAll(tmpdir)
-		})
-	} else {
+	if opt.tmpdir != "" {
 		os.RemoveAll(tmpdir)
 		tmpdir = opt.tmpdir
 	}
@@ -84,29 +63,29 @@ func newCacheManager(ctx context.Context, opt cmOpt) (co *cmOut, cleanup func() 
 	if opt.snapshotter == nil {
 		snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		opt.snapshotter = snapshotter
 	}
 
 	store, err := local.NewStore(tmpdir)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	db, err := bolt.Open(filepath.Join(tmpdir, "containerdmeta.db"), 0644, nil)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	defers = append(defers, func() error {
-		return db.Close()
+	t.Cleanup(func() {
+		require.NoError(t, db.Close())
 	})
 
 	mdb := ctdmetadata.NewDB(db, store, map[string]snapshots.Snapshotter{
 		opt.snapshotterName: opt.snapshotter,
 	})
 	if err := mdb.Init(context.TODO()); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	lm := leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), ns)
@@ -116,8 +95,11 @@ func newCacheManager(ctx context.Context, opt cmOpt) (co *cmOut, cleanup func() 
 
 	md, err := metadata.NewStore(filepath.Join(tmpdir, "metadata.db"))
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
+	t.Cleanup(func() {
+		require.NoError(t, md.Close())
+	})
 
 	cm, err := cache.NewManager(cache.ManagerOpt{
 		Snapshotter:    snapshot.FromContainerdSnapshotter(opt.snapshotterName, containerdsnapshot.NSSnapshotter(ns, mdb.Snapshotter(opt.snapshotterName)), nil),
@@ -127,16 +109,21 @@ func newCacheManager(ctx context.Context, opt cmOpt) (co *cmOut, cleanup func() 
 		Differ:         differ,
 		LeaseManager:   lm,
 		GarbageCollect: mdb.GarbageCollect,
+		Root:           tmpdir,
 		MountPoolRoot:  filepath.Join(tmpdir, "cachemounts"),
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
+	t.Cleanup(func() {
+		require.NoError(t, cm.Close())
+	})
+
 	return &cmOut{
 		manager: cm,
 		lm:      lm,
 		cs:      mdb.ContentStore(),
-	}, cleanup, nil
+	}, nil
 }
 
 func newRefGetter(m cache.Manager, shared *cacheRefs) *cacheRefGetter {
@@ -152,20 +139,19 @@ func TestCacheMountPrivateRefs(t *testing.T) {
 	t.Parallel()
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, snapshotter.Close())
+	})
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-
-	defer cleanup()
 
 	g1 := newRefGetter(co.manager, sharedCacheRefs)
 	g2 := newRefGetter(co.manager, sharedCacheRefs)
@@ -219,20 +205,19 @@ func TestCacheMountSharedRefs(t *testing.T) {
 	t.Parallel()
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, snapshotter.Close())
+	})
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-
-	defer cleanup()
 
 	g1 := newRefGetter(co.manager, sharedCacheRefs)
 	g2 := newRefGetter(co.manager, sharedCacheRefs)
@@ -269,20 +254,19 @@ func TestCacheMountLockedRefs(t *testing.T) {
 	t.Parallel()
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, snapshotter.Close())
+	})
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-
-	defer cleanup()
 
 	g1 := newRefGetter(co.manager, sharedCacheRefs)
 	g2 := newRefGetter(co.manager, sharedCacheRefs)
@@ -306,8 +290,8 @@ func TestCacheMountLockedRefs(t *testing.T) {
 	gotRef4 := make(chan struct{})
 	go func() {
 		ref4, err := g2.getRefCacheDir(ctx, nil, "foo", pb.CacheSharingOpt_LOCKED)
-		require.NoError(t, err)
-		require.Equal(t, ref.ID(), ref4.ID())
+		assert.NoError(t, err)
+		assert.Equal(t, ref.ID(), ref4.ID())
 		close(gotRef4)
 	}()
 
@@ -322,7 +306,7 @@ func TestCacheMountLockedRefs(t *testing.T) {
 
 	select {
 	case <-gotRef4:
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(2 * time.Second):
 		require.FailNow(t, "mount did not unlock")
 	}
 }
@@ -332,20 +316,19 @@ func TestCacheMountSharedRefsDeadlock(t *testing.T) {
 	// not parallel
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, snapshotter.Close())
+	})
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-
-	defer cleanup()
 
 	var sharedCacheRefs = &cacheRefs{}
 
@@ -378,7 +361,7 @@ func TestCacheMountSharedRefsDeadlock(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		err = eg.Wait()
-		require.NoError(t, err)
+		assert.NoError(t, err)
 		close(done)
 	}()
 

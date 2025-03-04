@@ -2,11 +2,10 @@ package content
 
 import (
 	"context"
-	"os"
 	"testing"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/content/local"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/plugins/content/local"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/testutil"
 	digest "github.com/opencontainers/go-digest"
@@ -23,10 +22,7 @@ func TestContentAttachable(t *testing.T) {
 	attachableStores := make(map[string]content.Store)
 	testBlobs := make(map[string]map[digest.Digest][]byte)
 	for _, id := range ids {
-		tmpDir, err := os.MkdirTemp("", "contenttest")
-		require.NoError(t, err)
-		defer os.RemoveAll(tmpDir)
-		store, err := local.NewStore(tmpDir)
+		store, err := local.NewStore(t.TempDir())
 		require.NoError(t, err)
 		blob := []byte("test-content-attachable-" + id)
 		w, err := store.Writer(ctx, content.WithRef(string(blob)))
@@ -44,7 +40,7 @@ func TestContentAttachable(t *testing.T) {
 		}
 	}
 
-	s, err := session.NewSession(ctx, "foo", "bar")
+	s, err := session.NewSession(ctx, "bar")
 	require.NoError(t, err)
 
 	m, err := session.NewManager()

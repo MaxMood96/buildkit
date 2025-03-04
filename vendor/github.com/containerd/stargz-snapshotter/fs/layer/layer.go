@@ -27,14 +27,13 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/reference"
+	"github.com/containerd/containerd/v2/pkg/reference"
+	"github.com/containerd/log"
 	"github.com/containerd/stargz-snapshotter/cache"
 	"github.com/containerd/stargz-snapshotter/estargz"
 	"github.com/containerd/stargz-snapshotter/estargz/zstdchunked"
@@ -50,7 +49,6 @@ import (
 	fusefs "github.com/hanwen/go-fuse/v2/fs"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -109,26 +107,28 @@ type Info struct {
 	FetchedSize  int64     // layer fetched size in bytes
 	PrefetchSize int64     // layer prefetch size in bytes
 	ReadTime     time.Time // last time the layer was read
+	TOCDigest    digest.Digest
 }
 
 // Resolver resolves the layer location and provieds the handler of that layer.
 type Resolver struct {
-	rootDir               string
-	resolver              *remote.Resolver
-	prefetchTimeout       time.Duration
-	layerCache            *cacheutil.TTLCache
-	layerCacheMu          sync.Mutex
-	blobCache             *cacheutil.TTLCache
-	blobCacheMu           sync.Mutex
-	backgroundTaskManager *task.BackgroundTaskManager
-	resolveLock           *namedmutex.NamedMutex
-	config                config.Config
-	metadataStore         metadata.Store
-	overlayOpaqueType     OverlayOpaqueType
+	rootDir                 string
+	resolver                *remote.Resolver
+	prefetchTimeout         time.Duration
+	layerCache              *cacheutil.TTLCache
+	layerCacheMu            sync.Mutex
+	blobCache               *cacheutil.TTLCache
+	blobCacheMu             sync.Mutex
+	backgroundTaskManager   *task.BackgroundTaskManager
+	resolveLock             *namedmutex.NamedMutex
+	config                  config.Config
+	metadataStore           metadata.Store
+	overlayOpaqueType       OverlayOpaqueType
+	additionalDecompressors func(context.Context, source.RegistryHosts, reference.Spec, ocispec.Descriptor) []metadata.Decompressor
 }
 
 // NewResolver returns a new layer resolver.
-func NewResolver(root string, backgroundTaskManager *task.BackgroundTaskManager, cfg config.Config, resolveHandlers map[string]remote.Handler, metadataStore metadata.Store, overlayOpaqueType OverlayOpaqueType) (*Resolver, error) {
+func NewResolver(root string, backgroundTaskManager *task.BackgroundTaskManager, cfg config.Config, resolveHandlers map[string]remote.Handler, metadataStore metadata.Store, overlayOpaqueType OverlayOpaqueType, additionalDecompressors func(context.Context, source.RegistryHosts, reference.Spec, ocispec.Descriptor) []metadata.Decompressor) (*Resolver, error) {
 	resolveResultEntryTTL := time.Duration(cfg.ResolveResultEntryTTLSec) * time.Second
 	if resolveResultEntryTTL == 0 {
 		resolveResultEntryTTL = defaultResolveResultEntryTTLSec * time.Second
@@ -144,10 +144,10 @@ func NewResolver(root string, backgroundTaskManager *task.BackgroundTaskManager,
 	layerCache := cacheutil.NewTTLCache(resolveResultEntryTTL)
 	layerCache.OnEvicted = func(key string, value interface{}) {
 		if err := value.(*layer).close(); err != nil {
-			logrus.WithField("key", key).WithError(err).Warnf("failed to clean up layer")
+			log.L.WithField("key", key).WithError(err).Warnf("failed to clean up layer")
 			return
 		}
-		logrus.WithField("key", key).Debugf("cleaned up layer")
+		log.L.WithField("key", key).Debugf("cleaned up layer")
 	}
 
 	// blobCache caches resolved blobs for futural use. This is especially useful when a layer
@@ -155,10 +155,10 @@ func NewResolver(root string, backgroundTaskManager *task.BackgroundTaskManager,
 	blobCache := cacheutil.NewTTLCache(resolveResultEntryTTL)
 	blobCache.OnEvicted = func(key string, value interface{}) {
 		if err := value.(remote.Blob).Close(); err != nil {
-			logrus.WithField("key", key).WithError(err).Warnf("failed to clean up blob")
+			log.L.WithField("key", key).WithError(err).Warnf("failed to clean up blob")
 			return
 		}
-		logrus.WithField("key", key).Debugf("cleaned up blob")
+		log.L.WithField("key", key).Debugf("cleaned up blob")
 	}
 
 	if err := os.MkdirAll(root, 0700); err != nil {
@@ -166,16 +166,17 @@ func NewResolver(root string, backgroundTaskManager *task.BackgroundTaskManager,
 	}
 
 	return &Resolver{
-		rootDir:               root,
-		resolver:              remote.NewResolver(cfg.BlobConfig, resolveHandlers),
-		layerCache:            layerCache,
-		blobCache:             blobCache,
-		prefetchTimeout:       prefetchTimeout,
-		backgroundTaskManager: backgroundTaskManager,
-		config:                cfg,
-		resolveLock:           new(namedmutex.NamedMutex),
-		metadataStore:         metadataStore,
-		overlayOpaqueType:     overlayOpaqueType,
+		rootDir:                 root,
+		resolver:                remote.NewResolver(cfg.BlobConfig, resolveHandlers),
+		layerCache:              layerCache,
+		blobCache:               blobCache,
+		prefetchTimeout:         prefetchTimeout,
+		backgroundTaskManager:   backgroundTaskManager,
+		config:                  cfg,
+		resolveLock:             new(namedmutex.NamedMutex),
+		metadataStore:           metadataStore,
+		overlayOpaqueType:       overlayOpaqueType,
+		additionalDecompressors: additionalDecompressors,
 	}, nil
 }
 
@@ -211,7 +212,7 @@ func newCache(root string, cacheType string, cfg config.Config) (cache.BlobCache
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return nil, err
 	}
-	cachePath, err := ioutil.TempDir(root, "")
+	cachePath, err := os.MkdirTemp(root, "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize directory cache: %w", err)
 	}
@@ -298,8 +299,13 @@ func (r *Resolver) Resolve(ctx context.Context, hosts source.RegistryHosts, refs
 			commonmetrics.MeasureLatencyInMilliseconds(commonmetrics.DeserializeTocJSON, desc.Digest, start)
 		},
 	}
+
+	additionalDecompressors := []metadata.Decompressor{new(zstdchunked.Decompressor)}
+	if r.additionalDecompressors != nil {
+		additionalDecompressors = append(additionalDecompressors, r.additionalDecompressors(ctx, hosts, refspec, desc)...)
+	}
 	meta, err := r.metadataStore(sr,
-		append(esgzOpts, metadata.WithTelemetry(&telemetry), metadata.WithDecompressors(new(zstdchunked.Decompressor)))...)
+		append(esgzOpts, metadata.WithTelemetry(&telemetry), metadata.WithDecompressors(additionalDecompressors...))...)
 	if err != nil {
 		return nil, err
 	}
@@ -409,6 +415,7 @@ func (l *layer) Info() Info {
 		FetchedSize:  l.blob.FetchedSize(),
 		PrefetchSize: l.prefetchedSize(),
 		ReadTime:     readTime,
+		TOCDigest:    l.verifiableReader.Metadata().TOCDigest(),
 	}
 }
 

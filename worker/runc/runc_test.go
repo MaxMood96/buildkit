@@ -1,5 +1,4 @@
-//go:build linux && !no_runc_worker
-// +build linux,!no_runc_worker
+//go:build linux
 
 package runc
 
@@ -14,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	ctdsnapshot "github.com/containerd/containerd/snapshots"
-	"github.com/containerd/containerd/snapshots/overlay"
+	ctdsnapshot "github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/containerd/v2/plugins/snapshots/overlay"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/executor"
@@ -28,10 +27,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newWorkerOpt(t *testing.T, processMode oci.ProcessMode) (base.WorkerOpt, func()) {
-	tmpdir, err := os.MkdirTemp("", "workertest")
-	require.NoError(t, err)
-	cleanup := func() { os.RemoveAll(tmpdir) }
+func newWorkerOpt(t *testing.T, processMode oci.ProcessMode) base.WorkerOpt {
+	tmpdir := t.TempDir()
 
 	snFactory := SnapshotterFactory{
 		Name: "overlayfs",
@@ -40,10 +37,10 @@ func newWorkerOpt(t *testing.T, processMode oci.ProcessMode) (base.WorkerOpt, fu
 		},
 	}
 	rootless := false
-	workerOpt, err := NewWorkerOpt(tmpdir, snFactory, rootless, processMode, nil, nil, netproviders.Opt{Mode: "host"}, nil, "", "", nil, "", "")
+	workerOpt, err := NewWorkerOpt(tmpdir, snFactory, rootless, processMode, nil, nil, netproviders.Opt{Mode: "host"}, nil, "", "", false, nil, "", "", nil)
 	require.NoError(t, err)
 
-	return workerOpt, cleanup
+	return workerOpt
 }
 
 func checkRequirement(t *testing.T) {
@@ -62,8 +59,7 @@ func TestRuncWorker(t *testing.T) {
 	t.Parallel()
 	checkRequirement(t)
 
-	workerOpt, cleanupWorkerOpt := newWorkerOpt(t, oci.ProcessSandbox)
-	defer cleanupWorkerOpt()
+	workerOpt := newWorkerOpt(t, oci.ProcessSandbox)
 	w, err := base.NewWorker(context.TODO(), workerOpt)
 	require.NoError(t, err)
 
@@ -85,7 +81,7 @@ func TestRuncWorker(t *testing.T) {
 
 	names, err := f.Readdirnames(-1)
 	require.NoError(t, err)
-	require.True(t, len(names) > 5)
+	require.Greater(t, len(names), 5)
 
 	err = f.Close()
 	require.NoError(t, err)
@@ -101,7 +97,7 @@ func TestRuncWorker(t *testing.T) {
 	// }
 
 	for _, d := range du {
-		require.True(t, d.Size >= 8192)
+		require.GreaterOrEqual(t, d.Size, int64(8192))
 	}
 
 	meta := executor.Meta{
@@ -110,7 +106,7 @@ func TestRuncWorker(t *testing.T) {
 	}
 
 	stderr := bytes.NewBuffer(nil)
-	err = w.WorkerOpt.Executor.Run(ctx, "", execMount(snap, true), nil, executor.ProcessInfo{Meta: meta, Stderr: &nopCloser{stderr}}, nil)
+	_, err = w.WorkerOpt.Executor.Run(ctx, "", execMount(snap, true), nil, executor.ProcessInfo{Meta: meta, Stderr: &nopCloser{stderr}}, nil)
 	require.Error(t, err) // Read-only root
 	// typical error is like `mkdir /.../rootfs/proc: read-only file system`.
 	// make sure the error is caused before running `echo foo > /bar`.
@@ -119,7 +115,7 @@ func TestRuncWorker(t *testing.T) {
 	root, err := w.CacheMgr.New(ctx, snap, nil, cache.CachePolicyRetain)
 	require.NoError(t, err)
 
-	err = w.WorkerOpt.Executor.Run(ctx, "", execMount(root, false), nil, executor.ProcessInfo{Meta: meta, Stderr: &nopCloser{stderr}}, nil)
+	_, err = w.WorkerOpt.Executor.Run(ctx, "", execMount(root, false), nil, executor.ProcessInfo{Meta: meta, Stderr: &nopCloser{stderr}}, nil)
 	require.NoError(t, err)
 
 	meta = executor.Meta{
@@ -127,7 +123,7 @@ func TestRuncWorker(t *testing.T) {
 		Cwd:  "/",
 	}
 
-	err = w.WorkerOpt.Executor.Run(ctx, "", execMount(root, false), nil, executor.ProcessInfo{Meta: meta, Stderr: &nopCloser{stderr}}, nil)
+	_, err = w.WorkerOpt.Executor.Run(ctx, "", execMount(root, false), nil, executor.ProcessInfo{Meta: meta, Stderr: &nopCloser{stderr}}, nil)
 	require.NoError(t, err)
 
 	rf, err := root.Commit(ctx)
@@ -141,11 +137,11 @@ func TestRuncWorker(t *testing.T) {
 	target, err = lm.Mount()
 	require.NoError(t, err)
 
-	//Verifies fix for issue https://github.com/moby/buildkit/issues/429
+	// verifies fix for issue https://github.com/moby/buildkit/issues/429
 	dt, err := os.ReadFile(filepath.Join(target, "run", "bar"))
 
 	require.NoError(t, err)
-	require.Equal(t, string(dt), "foo\n")
+	require.Equal(t, "foo\n", string(dt))
 
 	lm.Unmount()
 	require.NoError(t, err)
@@ -184,8 +180,7 @@ func TestRuncWorkerNoProcessSandbox(t *testing.T) {
 	t.Parallel()
 	checkRequirement(t)
 
-	workerOpt, cleanupWorkerOpt := newWorkerOpt(t, oci.NoProcessSandbox)
-	defer cleanupWorkerOpt()
+	workerOpt := newWorkerOpt(t, oci.NoProcessSandbox)
 	w, err := base.NewWorker(context.TODO(), workerOpt)
 	require.NoError(t, err)
 
@@ -206,7 +201,7 @@ func TestRuncWorkerNoProcessSandbox(t *testing.T) {
 	}
 	stdout := bytes.NewBuffer(nil)
 	stderr := bytes.NewBuffer(nil)
-	err = w.WorkerOpt.Executor.Run(ctx, "", execMount(root, false), nil, executor.ProcessInfo{Meta: meta, Stdout: &nopCloser{stdout}, Stderr: &nopCloser{stderr}}, nil)
+	_, err = w.WorkerOpt.Executor.Run(ctx, "", execMount(root, false), nil, executor.ProcessInfo{Meta: meta, Stdout: &nopCloser{stdout}, Stderr: &nopCloser{stderr}}, nil)
 	require.NoError(t, err, fmt.Sprintf("stdout=%q, stderr=%q", stdout.String(), stderr.String()))
 	require.Equal(t, string(selfCmdline), stdout.String())
 }
@@ -215,8 +210,7 @@ func TestRuncWorkerExec(t *testing.T) {
 	t.Parallel()
 	checkRequirement(t)
 
-	workerOpt, cleanupWorkerOpt := newWorkerOpt(t, oci.ProcessSandbox)
-	defer cleanupWorkerOpt()
+	workerOpt := newWorkerOpt(t, oci.ProcessSandbox)
 	w, err := base.NewWorker(context.TODO(), workerOpt)
 	require.NoError(t, err)
 
@@ -227,12 +221,22 @@ func TestRuncWorkerExecFailures(t *testing.T) {
 	t.Parallel()
 	checkRequirement(t)
 
-	workerOpt, cleanupWorkerOpt := newWorkerOpt(t, oci.ProcessSandbox)
-	defer cleanupWorkerOpt()
+	workerOpt := newWorkerOpt(t, oci.ProcessSandbox)
 	w, err := base.NewWorker(context.TODO(), workerOpt)
 	require.NoError(t, err)
 
 	tests.TestWorkerExecFailures(t, w)
+}
+
+func TestRuncWorkerCancel(t *testing.T) {
+	t.Parallel()
+	checkRequirement(t)
+
+	workerOpt := newWorkerOpt(t, oci.ProcessSandbox)
+	w, err := base.NewWorker(context.TODO(), workerOpt)
+	require.NoError(t, err)
+
+	tests.TestWorkerCancel(t, w)
 }
 
 type nopCloser struct {

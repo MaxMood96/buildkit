@@ -7,6 +7,7 @@ import (
 
 	"github.com/moby/buildkit/client"
 	bccommon "github.com/moby/buildkit/cmd/buildctl/common"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/tonistiigi/units"
 	"github.com/urfave/cli"
 )
@@ -24,6 +25,14 @@ var pruneCommand = cli.Command{
 			Name:  "keep-storage",
 			Usage: "Keep data below this limit (in MB)",
 		},
+		cli.Float64Flag{
+			Name:  "keep-storage-min",
+			Usage: "Always allow data above this limit (in MB)",
+		},
+		cli.Float64Flag{
+			Name:  "free-storage",
+			Usage: "Keep free data below this limit (in MB)",
+		},
 		cli.StringSliceFlag{
 			Name:  "filter, f",
 			Usage: "Filter records",
@@ -36,6 +45,10 @@ var pruneCommand = cli.Command{
 			Name:  "verbose, v",
 			Usage: "Verbose output",
 		},
+		cli.StringFlag{
+			Name:  "format",
+			Usage: "Format the output using the given Go template, e.g, '{{json .}}'",
+		},
 	},
 }
 
@@ -47,35 +60,67 @@ func prune(clicontext *cli.Context) error {
 
 	ch := make(chan client.UsageInfo)
 	printed := make(chan struct{})
-
-	tw := tabwriter.NewWriter(os.Stdout, 1, 8, 1, '\t', 0)
-	first := true
-	total := int64(0)
-
-	go func() {
-		defer close(printed)
-		for du := range ch {
-			total += du.Size
-			if clicontext.Bool("verbose") {
-				printVerbose(tw, []*client.UsageInfo{&du})
-			} else {
-				if first {
-					printTableHeader(tw)
-					first = false
-				}
-				printTableRow(tw, &du)
-				tw.Flush()
-			}
-		}
-	}()
+	var summarizer func()
 
 	opts := []client.PruneOption{
 		client.WithFilter(clicontext.StringSlice("filter")),
-		client.WithKeepOpt(clicontext.Duration("keep-duration"), int64(clicontext.Float64("keep-storage")*1e6)),
+		client.WithKeepOpt(
+			clicontext.Duration("keep-duration"),
+			int64(clicontext.Float64("keep-storage-min")*1e6),
+			int64(clicontext.Float64("keep-storage")*1e6),
+			int64(clicontext.Float64("free-storage")*1e6),
+		),
 	}
 
 	if clicontext.Bool("all") {
 		opts = append(opts, client.PruneAll)
+	}
+
+	if format := clicontext.String("format"); format != "" {
+		if clicontext.Bool("verbose") {
+			bklog.L.Debug("Ignoring --verbose")
+		}
+		tmpl, err := bccommon.ParseTemplate(format)
+		if err != nil {
+			return err
+		}
+		go func() {
+			defer close(printed)
+			for du := range ch {
+				// Unlike `buildctl du`, the template is applied to a UsageInfo, not to a slice of UsageInfo
+				if err := tmpl.Execute(clicontext.App.Writer, du); err != nil {
+					panic(err)
+				}
+				if _, err = fmt.Fprintf(clicontext.App.Writer, "\n"); err != nil {
+					panic(err)
+				}
+			}
+		}()
+	} else {
+		tw := tabwriter.NewWriter(os.Stdout, 1, 8, 1, '\t', 0)
+		first := true
+		total := int64(0)
+		go func() {
+			defer close(printed)
+			for du := range ch {
+				total += du.Size
+				if clicontext.Bool("verbose") {
+					printVerbose(tw, []*client.UsageInfo{&du})
+				} else {
+					if first {
+						printTableHeader(tw)
+						first = false
+					}
+					printTableRow(tw, &du)
+					tw.Flush()
+				}
+			}
+		}()
+		summarizer = func() {
+			tw = tabwriter.NewWriter(os.Stdout, 1, 8, 1, '\t', 0)
+			fmt.Fprintf(tw, "Total:\t%.2f\n", units.Bytes(total))
+			tw.Flush()
+		}
 	}
 
 	err = c.Prune(bccommon.CommandContext(clicontext), ch, opts...)
@@ -84,10 +129,8 @@ func prune(clicontext *cli.Context) error {
 	if err != nil {
 		return err
 	}
-
-	tw = tabwriter.NewWriter(os.Stdout, 1, 8, 1, '\t', 0)
-	fmt.Fprintf(tw, "Total:\t%.2f\n", units.Bytes(total))
-	tw.Flush()
-
+	if summarizer != nil {
+		summarizer()
+	}
 	return nil
 }

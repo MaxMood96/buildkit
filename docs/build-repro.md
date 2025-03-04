@@ -1,129 +1,67 @@
 # Build reproducibility
 
-## Build dependencies
+## Reproducing the pinned dependencies
 
-Build dependencies are generated when your image has been built. These
-dependencies include versions of used images, git repositories and HTTP URLs
-used by LLB `Source` operation as well as build request attributes.
+Reproducing the pinned dependencies is supported since BuildKit v0.11.
 
-The structure is base64 encoded and has the following format when decoded:
+e.g.,
+```bash
+buildctl build --frontend dockerfile.v0 --local dockerfile=. --local context=. --source-policy-file policy.json
+```
 
+An example `policy.json`:
 ```json
 {
-  "frontend": "dockerfile.v0",
-  "attrs": {
-    "build-arg:foo": "bar",
-    "context": "https://github.com/crazy-max/buildkit-buildsources-test.git#master",
-    "filename": "Dockerfile",
-    "platform": "linux/amd64,linux/arm64",
-    "source": "crazymax/dockerfile:master"
-  },
-  "sources": [
+  "rules": [
     {
-      "type": "docker-image",
-      "ref": "docker.io/docker/buildx-bin:0.6.1@sha256:a652ced4a4141977c7daaed0a074dcd9844a78d7d2615465b12f433ae6dd29f0",
-      "pin": "sha256:a652ced4a4141977c7daaed0a074dcd9844a78d7d2615465b12f433ae6dd29f0"
+      "action": "CONVERT",
+      "selector": {
+        "identifier": "docker-image://docker.io/library/alpine:latest"
+      },
+      "updates": {
+        "identifier": "docker-image://docker.io/library/alpine:latest@sha256:4edbd2beb5f78b1014028f4fbb99f3237d9561100b6881aabbf5acce2c4f9454"
+      }
     },
     {
-      "type": "docker-image",
-      "ref": "docker.io/library/alpine:3.13",
-      "pin": "sha256:1d30d1ba3cb90962067e9b29491fbd56997979d54376f23f01448b5c5cd8b462"
-    },
-    {
-      "type": "git",
-      "ref": "https://github.com/crazy-max/buildkit-buildsources-test.git#master",
-      "pin": "259a5aa5aa5bb3562d12cc631fe399f4788642c1"
-    },
-    {
-      "type": "http",
-      "ref": "https://raw.githubusercontent.com/moby/moby/master/README.md",
-      "pin": "sha256:419455202b0ef97e480d7f8199b26a721a417818bc0e2d106975f74323f25e6c"
+      "action": "CONVERT",
+      "selector": {
+        "identifier": "https://raw.githubusercontent.com/moby/buildkit/v0.10.1/README.md"
+      },
+      "updates": {
+        "attrs": {"http.checksum": "sha256:6e4b94fc270e708e1068be28bd3551dc6917a4fc5a61293d51bb36e6b75c4b53"}
+      }
     }
   ]
 }
 ```
 
-* `frontend` defines the frontend used to build.
-* `attrs` defines build request attributes.
-* `sources` defines build sources.
-  * `type` defines the source type (`docker-image`, `git` or `http`).
-  * `ref` is the reference of the source.
-  * `pin` is the source digest.
-* `deps` defines build dependencies of input contexts.
+Any source type is supported, but how to pin a source depends on the type.
 
-### Image config
+## `SOURCE_DATE_EPOCH`
+[`SOURCE_DATE_EPOCH`](https://reproducible-builds.org/docs/source-date-epoch/) is the convention for pinning timestamps to a specific value.
 
-A new field similar to the one for inline cache has been added to the image
-configuration to embed build dependencies:
+The Dockerfile frontend supports consuming the `SOURCE_DATE_EPOCH` value as a special build arg, since BuildKit 0.11.
+Minimal support is also available on older BuildKit when using Dockerfile 1.5 frontend.
 
-```json
-{
-  "moby.buildkit.buildinfo.v0": "<base64>"
-}
+```console
+buildctl build --frontend dockerfile.v0 --opt build-arg:SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct) ...
+```
+The `buildctl` CLI (>= v0.13) and Docker Buildx (>= 0.10) automatically propagate the `$SOURCE_DATE_EPOCH` environment value from the client host to the `SOURCE_DATE_EPOCH` build arg.
+
+The build arg value is used for:
+- the `created` timestamp in the [OCI Image Config](https://github.com/opencontainers/image-spec/blob/main/config.md#properties)
+- the `created` timestamp in the `history` objects in the [OCI Image Config](https://github.com/opencontainers/image-spec/blob/main/config.md#properties)
+- the `org.opencontainers.image.created` annotation in the [OCI Image Index](https://github.com/opencontainers/image-spec/blob/main/annotations.md#pre-defined-annotation-keys)
+- the timestamp of the files exported with the `local` exporter
+- the timestamp of the files exported with the `tar` exporter
+
+To apply the build arg value to the timestamps of the files inside the image, specify `rewrite-timestamp=true` as an image exporter option:
+```
+--output type=image,name=docker.io/username/image,push=true,rewrite-timestamp=true
 ```
 
-By default, the build dependencies are inlined in the image configuration. You
-can disable this behavior with the [`buildinfo` attribute](../README.md#imageregistry).
+The `rewrite-timestamp` option is available since BuildKit v0.13.
+See [v0.12 documentation](https://github.com/moby/buildkit/blob/v0.12/docs/build-repro.md#caveats) for dealing with timestamps
+in BuildKit v0.12 and v0.11.
 
-### Exporter response (metadata)
-
-The solver response (`ExporterResponse`) also contains a new key
-`containerimage.buildinfo` with the same structure as image config encoded in
-base64:
-
-```json
-{
-  "ExporterResponse": {
-    "containerimage.buildinfo": "<base64>",
-    "containerimage.digest": "sha256:..."
-  }
-}
-```
-
-If multi-platforms are specified, they will be suffixed with the corresponding
-platform:
-
-```json
-{
-  "ExporterResponse": {
-    "containerimage.buildinfo/linux/amd64": "<base64>",
-    "containerimage.buildinfo/linux/arm64": "<base64>",
-    "containerimage.digest": "sha256:..."
-  }
-}
-```
-
-### Metadata JSON output
-
-If you're using the `--metadata-file` flag with [`buildctl`](../README.md#metadata),
-[`buildx build`](https://github.com/docker/buildx/blob/master/docs/reference/buildx_build.md)
-or [`buildx bake`](https://github.com/docker/buildx/blob/master/docs/reference/buildx_bake.md):
-
-```shell
-jq '.' metadata.json
-```
-```json
-{
-  "containerimage.buildinfo": {
-    "frontend": "dockerfile.v0",
-    "attrs": {
-      "context": "https://github.com/crazy-max/buildkit-buildsources-test.git#master",
-      "filename": "Dockerfile",
-      "source": "docker/dockerfile:master"
-    },
-    "sources": [
-      {
-        "type": "docker-image",
-        "ref": "docker.io/docker/buildx-bin:0.6.1@sha256:a652ced4a4141977c7daaed0a074dcd9844a78d7d2615465b12f433ae6dd29f0",
-        "pin": "sha256:a652ced4a4141977c7daaed0a074dcd9844a78d7d2615465b12f433ae6dd29f0"
-      },
-      {
-        "type": "docker-image",
-        "ref": "docker.io/library/alpine:3.13",
-        "pin": "sha256:026f721af4cf2843e07bba648e158fb35ecc876d822130633cc49f707f0fc88c"
-      }
-    ]
-  },
-  "containerimage.digest": "sha256:..."
-}
-```
+See also the [documentation](/frontend/dockerfile/docs/reference.md#buildkit-built-in-build-args) of the Dockerfile frontend.

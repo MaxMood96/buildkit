@@ -18,8 +18,8 @@ type buildOpt struct {
 func main() {
 	var opt buildOpt
 	flag.BoolVar(&opt.withContainerd, "with-containerd", true, "enable containerd worker")
-	flag.StringVar(&opt.containerd, "containerd", "v1.2.9", "containerd version")
-	flag.StringVar(&opt.runc, "runc", "v1.0.0-rc8", "runc version")
+	flag.StringVar(&opt.containerd, "containerd", "v1.7.2", "containerd version")
+	flag.StringVar(&opt.runc, "runc", "v1.1.7", "runc version")
 	flag.Parse()
 
 	bk := buildkit(opt)
@@ -33,7 +33,7 @@ func main() {
 }
 
 func goBuildBase() llb.State {
-	goAlpine := llb.Image("docker.io/library/golang:1.17-alpine")
+	goAlpine := llb.Image("docker.io/library/golang:1.23-alpine")
 	return goAlpine.
 		AddEnv("PATH", "/usr/local/go/bin:"+system.DefaultPathEnvUnix).
 		AddEnv("GOPATH", "/go").
@@ -51,15 +51,12 @@ func runc(version string) llb.State {
 func containerd(version string) llb.State {
 	return goBuildBase().
 		Run(llb.Shlex("apk add --no-cache btrfs-progs-dev")).
-		With(goFromGit("github.com/containerd/containerd", version)).
+		With(goFromGit("github.com/containerd/containerd/v2/client", version)).
 		Run(llb.Shlex("make bin/containerd")).Root()
 }
 
 func buildkit(opt buildOpt) llb.State {
 	src := goBuildBase().With(goFromGit("github.com/moby/buildkit", "master"))
-
-	buildkitdOCIWorkerOnly := src.
-		Run(llb.Shlex("go build -o /bin/buildkitd.oci_only -tags no_containerd_worker ./cmd/buildkitd")).Root()
 
 	buildkitd := src.
 		Run(llb.Shlex("go build -o /bin/buildkitd ./cmd/buildkitd")).Root()
@@ -69,15 +66,16 @@ func buildkit(opt buildOpt) llb.State {
 
 	r := llb.Image("docker.io/library/alpine:latest").With(
 		copyFrom(buildctl, "/bin/buildctl", "/bin/"),
+		copyFrom(buildkitd, "/bin/buildkitd", "/bin/"),
 		copyFrom(runc(opt.runc), "/usr/bin/runc", "/bin/"),
 	)
 
 	if opt.withContainerd {
-		return r.With(
+		r = r.With(
 			copyFrom(containerd(opt.containerd), "/go/src/github.com/containerd/containerd/bin/containerd", "/bin/"),
-			copyFrom(buildkitd, "/bin/buildkitd", "/bin/"))
+		)
 	}
-	return r.With(copyFrom(buildkitdOCIWorkerOnly, "/bin/buildkitd.oci_only", "/bin/"))
+	return r
 }
 
 // goFromGit is a helper for cloning a git repo, checking out a tag and copying

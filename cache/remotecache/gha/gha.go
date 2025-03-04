@@ -5,42 +5,58 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/containerd/containerd/content"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/pkg/labels"
 	"github.com/moby/buildkit/cache/remotecache"
 	v1 "github.com/moby/buildkit/cache/remotecache/v1"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/util/tracing"
+	bkversion "github.com/moby/buildkit/version"
 	"github.com/moby/buildkit/worker"
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	actionscache "github.com/tonistiigi/go-actions-cache"
 	"golang.org/x/sync/errgroup"
 )
 
 func init() {
-	actionscache.Log = logrus.Debugf
+	actionscache.Log = bklog.L.Debugf
 }
 
 const (
-	attrScope = "scope"
-	attrToken = "token"
-	attrURL   = "url"
-	version   = "1"
+	attrScope      = "scope"
+	attrTimeout    = "timeout"
+	attrToken      = "token"
+	attrURL        = "url"
+	attrURLV2      = "url_v2"
+	attrRepository = "repository"
+	attrGHToken    = "ghtoken"
+	attrAPIVersion = "version"
+	version        = "1"
+
+	defaultTimeout = 10 * time.Minute
 )
 
 type Config struct {
-	Scope string
-	URL   string
-	Token string
+	Scope      string
+	URL        string
+	Token      string // token for the Github Cache runtime API
+	GHToken    string // token for the Github REST API
+	Repository string
+	Version    int
+	Timeout    time.Duration
 }
 
 func getConfig(attrs map[string]string) (*Config, error) {
@@ -48,18 +64,57 @@ func getConfig(attrs map[string]string) (*Config, error) {
 	if !ok {
 		scope = "buildkit"
 	}
-	url, ok := attrs[attrURL]
-	if !ok {
-		return nil, errors.Errorf("url not set for github actions cache")
-	}
 	token, ok := attrs[attrToken]
 	if !ok {
 		return nil, errors.Errorf("token not set for github actions cache")
 	}
+	var apiVersionInt int
+	apiVersion, ok := attrs[attrAPIVersion]
+	if ok {
+		i, err := strconv.ParseInt(apiVersion, 10, 64)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to parse api version %q, expected positive integer", apiVersion)
+		}
+		apiVersionInt = int(i)
+	}
+	var url string
+	if apiVersionInt != 1 {
+		if v, ok := attrs[attrURLV2]; ok {
+			url = v
+			apiVersionInt = 2
+		}
+	}
+	if v, ok := attrs[attrURL]; ok && url == "" {
+		url = v
+	}
+	if url == "" {
+		return nil, errors.Errorf("url not set for github actions cache")
+	}
+	// best effort on old clients
+	if apiVersionInt == 0 {
+		if strings.Contains(url, "results-receiver.actions.githubusercontent.com") {
+			apiVersionInt = 2
+		} else {
+			apiVersionInt = 1
+		}
+	}
+
+	timeout := defaultTimeout
+	if v, ok := attrs[attrTimeout]; ok {
+		var err error
+		timeout, err = time.ParseDuration(v)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to parse timeout for github actions cache")
+		}
+	}
 	return &Config{
-		Scope: scope,
-		URL:   url,
-		Token: token,
+		Scope:      scope,
+		URL:        url,
+		Token:      token,
+		Timeout:    timeout,
+		GHToken:    attrs[attrGHToken],
+		Repository: attrs[attrRepository],
+		Version:    apiVersionInt,
 	}, nil
 }
 
@@ -76,18 +131,28 @@ func ResolveCacheExporterFunc() remotecache.ResolveCacheExporterFunc {
 
 type exporter struct {
 	solver.CacheExporterTarget
-	chains *v1.CacheChains
-	cache  *actionscache.Cache
-	config *Config
+	chains     *v1.CacheChains
+	cache      *actionscache.Cache
+	config     *Config
+	keyMapOnce sync.Once
+	keyMap     map[string]struct{}
 }
 
 func NewExporter(c *Config) (remotecache.Exporter, error) {
 	cc := v1.NewCacheChains()
-	cache, err := actionscache.New(c.Token, c.URL, actionscache.Opt{Client: tracing.DefaultClient})
+	cache, err := actionscache.New(c.Token, c.URL, c.Version > 1, actionscache.Opt{
+		Client:    tracing.DefaultClient,
+		Timeout:   c.Timeout,
+		UserAgent: bkversion.UserAgent(),
+	})
 	if err != nil {
 		return nil, err
 	}
 	return &exporter{CacheExporterTarget: cc, chains: cc, cache: cache, config: c}, nil
+}
+
+func (*exporter) Name() string {
+	return "exporting to GitHub Actions Cache"
 }
 
 func (ce *exporter) Config() remotecache.Config {
@@ -96,8 +161,12 @@ func (ce *exporter) Config() remotecache.Config {
 	}
 }
 
+func (ce *exporter) blobKeyPrefix() string {
+	return "buildkit-blob-" + version + "-"
+}
+
 func (ce *exporter) blobKey(dgst digest.Digest) string {
-	return "buildkit-blob-" + version + "-" + dgst.String()
+	return ce.blobKeyPrefix() + dgst.String()
 }
 
 func (ce *exporter) indexKey() string {
@@ -109,6 +178,35 @@ func (ce *exporter) indexKey() string {
 	}
 	scope = digest.FromBytes([]byte(scope)).Hex()[:8]
 	return "index-" + ce.config.Scope + "-" + version + "-" + scope
+}
+
+func (ce *exporter) initActiveKeyMap(ctx context.Context) {
+	ce.keyMapOnce.Do(func() {
+		if ce.config.Repository == "" || ce.config.GHToken == "" {
+			return
+		}
+		m, err := ce.initActiveKeyMapOnce(ctx)
+		if err != nil {
+			bklog.G(ctx).Errorf("error initializing active key map: %v", err)
+			return
+		}
+		ce.keyMap = m
+	})
+}
+
+func (ce *exporter) initActiveKeyMapOnce(ctx context.Context) (map[string]struct{}, error) {
+	api, err := actionscache.NewRestAPI(ce.config.Repository, ce.config.GHToken, actionscache.Opt{
+		Client:  tracing.DefaultClient,
+		Timeout: ce.config.Timeout,
+	})
+	if err != nil {
+		return nil, err
+	}
+	keys, err := ce.cache.AllKeys(ctx, api, ce.blobKeyPrefix())
+	if err != nil {
+		return nil, err
+	}
+	return keys, nil
 }
 
 func (ce *exporter) Finalize(ctx context.Context) (map[string]string, error) {
@@ -128,7 +226,7 @@ func (ce *exporter) Finalize(ctx context.Context) (map[string]string, error) {
 			return nil, errors.Errorf("invalid descriptor without annotations")
 		}
 		var diffID digest.Digest
-		v, ok := dgstPair.Descriptor.Annotations["containerd.io/uncompressed"]
+		v, ok := dgstPair.Descriptor.Annotations[labels.LabelUncompressed]
 		if !ok {
 			return nil, errors.Errorf("invalid descriptor without uncompressed annotation")
 		}
@@ -137,14 +235,26 @@ func (ce *exporter) Finalize(ctx context.Context) (map[string]string, error) {
 			return nil, errors.Wrapf(err, "failed to parse uncompressed annotation")
 		}
 		diffID = dgst
+		ce.initActiveKeyMap(ctx)
 
 		key := ce.blobKey(dgstPair.Descriptor.Digest)
-		b, err := ce.cache.Load(ctx, key)
-		if err != nil {
-			return nil, err
+
+		exists := false
+		if ce.keyMap != nil {
+			if _, ok := ce.keyMap[key]; ok {
+				exists = true
+			}
+		} else {
+			b, err := ce.cache.Load(ctx, key)
+			if err != nil {
+				return nil, err
+			}
+			if b != nil {
+				exists = true
+			}
 		}
-		if b == nil {
-			layerDone := oneOffProgress(ctx, fmt.Sprintf("writing layer %s", l.Blob))
+		if !exists {
+			layerDone := progress.OneOff(ctx, fmt.Sprintf("writing layer %s", l.Blob))
 			ra, err := dgstPair.Provider.ReaderAt(ctx, dgstPair.Descriptor)
 			if err != nil {
 				return nil, layerDone(err)
@@ -206,7 +316,11 @@ type importer struct {
 }
 
 func NewImporter(c *Config) (remotecache.Importer, error) {
-	cache, err := actionscache.New(c.Token, c.URL, actionscache.Opt{Client: tracing.DefaultClient})
+	cache, err := actionscache.New(c.Token, c.URL, c.Version > 1, actionscache.Opt{
+		Client:    tracing.DefaultClient,
+		Timeout:   c.Timeout,
+		UserAgent: bkversion.UserAgent(),
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -221,7 +335,7 @@ func (ci *importer) makeDescriptorProviderPair(l v1.CacheLayer) (*v1.DescriptorP
 	if l.Annotations.DiffID == "" {
 		return nil, errors.Errorf("cache layer with missing diffid")
 	}
-	annotations["containerd.io/uncompressed"] = l.Annotations.DiffID.String()
+	annotations[labels.LabelUncompressed] = l.Annotations.DiffID.String()
 	if !l.Annotations.CreatedAt.IsZero() {
 		txt, err := l.Annotations.CreatedAt.MarshalText()
 		if err != nil {
@@ -235,9 +349,11 @@ func (ci *importer) makeDescriptorProviderPair(l v1.CacheLayer) (*v1.DescriptorP
 		Size:        l.Annotations.Size,
 		Annotations: annotations,
 	}
+	p := &ciProvider{desc: desc, ci: ci}
 	return &v1.DescriptorProviderPair{
-		Descriptor: desc,
-		Provider:   &ciProvider{desc: desc, ci: ci},
+		Descriptor:   desc,
+		Provider:     p,
+		InfoProvider: p,
 	}, nil
 }
 
@@ -322,13 +438,18 @@ type ciProvider struct {
 	entries map[digest.Digest]*actionscache.Entry
 }
 
-func (p *ciProvider) CheckDescriptor(ctx context.Context, desc ocispecs.Descriptor) error {
-	if desc.Digest != p.desc.Digest {
-		return nil
+func (p *ciProvider) Info(ctx context.Context, dgst digest.Digest) (content.Info, error) {
+	if dgst != p.desc.Digest {
+		return content.Info{}, errors.Errorf("content not found %s", dgst)
 	}
 
-	_, err := p.loadEntry(ctx, desc)
-	return err
+	if _, err := p.loadEntry(ctx, p.desc); err != nil {
+		return content.Info{}, err
+	}
+	return content.Info{
+		Digest: p.desc.Digest,
+		Size:   p.desc.Size,
+	}, nil
 }
 
 func (p *ciProvider) loadEntry(ctx context.Context, desc ocispecs.Descriptor) (*actionscache.Entry, error) {
@@ -367,22 +488,13 @@ type readerAt struct {
 	desc ocispecs.Descriptor
 }
 
-func (r *readerAt) Size() int64 {
-	return r.desc.Size
+func (r *readerAt) ReadAt(p []byte, off int64) (int, error) {
+	if off >= r.desc.Size {
+		return 0, io.EOF
+	}
+	return r.ReaderAtCloser.ReadAt(p, off)
 }
 
-func oneOffProgress(ctx context.Context, id string) func(err error) error {
-	pw, _, _ := progress.NewFromContext(ctx)
-	now := time.Now()
-	st := progress.Status{
-		Started: &now,
-	}
-	pw.Write(id, st)
-	return func(err error) error {
-		now := time.Now()
-		st.Completed = &now
-		pw.Write(id, st)
-		pw.Close()
-		return err
-	}
+func (r *readerAt) Size() int64 {
+	return r.desc.Size
 }

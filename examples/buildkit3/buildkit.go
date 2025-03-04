@@ -19,8 +19,8 @@ type buildOpt struct {
 func main() {
 	var opt buildOpt
 	flag.BoolVar(&opt.withContainerd, "with-containerd", true, "enable containerd worker")
-	flag.StringVar(&opt.containerd, "containerd", "v1.2.9", "containerd version")
-	flag.StringVar(&opt.runc, "runc", "v1.0.0-rc8", "runc version")
+	flag.StringVar(&opt.containerd, "containerd", "v1.7.2", "containerd version")
+	flag.StringVar(&opt.runc, "runc", "v1.1.7", "runc version")
 	flag.StringVar(&opt.buildkit, "buildkit", "master", "buildkit version")
 	flag.Parse()
 
@@ -34,7 +34,7 @@ func main() {
 }
 
 func goBuildBase() llb.State {
-	goAlpine := llb.Image("docker.io/library/golang:1.17-alpine")
+	goAlpine := llb.Image("docker.io/library/golang:1.23-alpine")
 	return goAlpine.
 		AddEnv("PATH", "/usr/local/go/bin:"+system.DefaultPathEnvUnix).
 		AddEnv("GOPATH", "/go").
@@ -62,7 +62,7 @@ func runc(version string) llb.State {
 }
 
 func containerd(version string) llb.State {
-	repo := "github.com/containerd/containerd"
+	repo := "github.com/containerd/containerd/v2/client"
 	src := llb.Git(repo, version, llb.KeepGitDir())
 	if version == "local" {
 		src = llb.Local("containerd-src")
@@ -83,23 +83,22 @@ func buildkit(opt buildOpt) llb.State {
 	}
 	run := goRepo(goBuildBase(), repo, src)
 
-	buildkitdOCIWorkerOnly := run(llb.Shlex("go build -o /out/buildkitd.oci_only -tags no_containerd_worker ./cmd/buildkitd"))
-
 	buildkitd := run(llb.Shlex("go build -o /out/buildkitd ./cmd/buildkitd"))
 
 	buildctl := run(llb.Shlex("go build -o /out/buildctl ./cmd/buildctl"))
 
 	r := llb.Scratch().With(
 		copyAll(buildctl, "/"),
+		copyAll(buildkitd, "/"),
 		copyAll(runc(opt.runc), "/"),
 	)
 
 	if opt.withContainerd {
-		return r.With(
+		r = r.With(
 			copyAll(containerd(opt.containerd), "/"),
-			copyAll(buildkitd, "/"))
+		)
 	}
-	return r.With(copyAll(buildkitdOCIWorkerOnly, "/"))
+	return r
 }
 
 func copyAll(src llb.State, destPath string) llb.StateOption {

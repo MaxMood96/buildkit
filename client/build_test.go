@@ -3,8 +3,6 @@ package client
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -16,7 +14,6 @@ import (
 	"time"
 
 	"github.com/moby/buildkit/client/llb"
-	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/frontend/gateway/client"
 	gatewayapi "github.com/moby/buildkit/frontend/gateway/pb"
 	"github.com/moby/buildkit/identity"
@@ -25,15 +22,17 @@ import (
 	"github.com/moby/buildkit/session/sshforward/sshprovider"
 	"github.com/moby/buildkit/solver/errdefs"
 	"github.com/moby/buildkit/solver/pb"
-	binfotypes "github.com/moby/buildkit/util/buildinfo/types"
 	"github.com/moby/buildkit/util/entitlements"
+	"github.com/moby/buildkit/util/grpcerrors"
 	utilsystem "github.com/moby/buildkit/util/system"
 	"github.com/moby/buildkit/util/testutil/echoserver"
 	"github.com/moby/buildkit/util/testutil/integration"
-	digest "github.com/opencontainers/go-digest"
+	"github.com/moby/buildkit/util/testutil/workers"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
+	"github.com/tonistiigi/fsutil"
 	"golang.org/x/crypto/ssh/agent"
+	"google.golang.org/grpc/codes"
 )
 
 func TestClientGatewayIntegration(t *testing.T) {
@@ -48,8 +47,11 @@ func TestClientGatewayIntegration(t *testing.T) {
 		testClientGatewayContainerPID1Fail,
 		testClientGatewayContainerPID1Exit,
 		testClientGatewayContainerMounts,
+		testClientGatewayContainerSecretEnv,
 		testClientGatewayContainerPID1Tty,
+		testClientGatewayContainerCancelPID1Tty,
 		testClientGatewayContainerExecTty,
+		testClientGatewayContainerCancelExecTty,
 		testClientSlowCacheRootfsRef,
 		testClientGatewayContainerPlatformPATH,
 		testClientGatewayExecError,
@@ -58,11 +60,13 @@ func TestClientGatewayIntegration(t *testing.T) {
 		testClientGatewayContainerExtraHosts,
 		testClientGatewayContainerSignal,
 		testWarnings,
-		testClientGatewayFrontendAttrs,
+		testClientGatewayNilResult,
+		testClientGatewayEmptyImageExec,
 	), integration.WithMirroredImages(integration.OfficialImages("busybox:latest")))
 
 	integration.Run(t, integration.TestFuncs(
-		testClientGatewayContainerSecurityMode,
+		testClientGatewayContainerSecurityModeCaps,
+		testClientGatewayContainerSecurityModeValidation,
 	), integration.WithMirroredImages(integration.OfficialImages("busybox:latest")),
 		integration.WithMatrix("secmode", map[string]interface{}{
 			"sandbox":  securitySandbox,
@@ -71,7 +75,8 @@ func TestClientGatewayIntegration(t *testing.T) {
 	)
 
 	integration.Run(t, integration.TestFuncs(
-		testClientGatewayContainerHostNetworking,
+		testClientGatewayContainerHostNetworkingAccess,
+		testClientGatewayContainerHostNetworkingValidation,
 	),
 		integration.WithMirroredImages(integration.OfficialImages("busybox:latest")),
 		integration.WithMatrix("netmode", map[string]interface{}{
@@ -133,9 +138,7 @@ func testClientGatewaySolve(t *testing.T, sb integration.Sandbox) {
 		return r, nil
 	}
 
-	tmpdir, err := os.MkdirTemp("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	testStr := "This is a test"
 
@@ -197,7 +200,7 @@ func testWarnings(t *testing.T, sb integration.Sandbox) {
 				Data:     []byte("filedata"),
 			},
 			Range: []*pb.Range{
-				{Start: pb.Position{Line: 2}, End: pb.Position{Line: 4}},
+				{Start: &pb.Position{Line: 2}, End: &pb.Position{Line: 4}},
 			},
 			Detail: [][]byte{[]byte("this is detail"), []byte("and more detail")},
 			URL:    "https://example.com",
@@ -206,43 +209,14 @@ func testWarnings(t *testing.T, sb integration.Sandbox) {
 		return r, nil
 	}
 
-	status := make(chan *SolveStatus)
-	statusDone := make(chan struct{})
-	done := make(chan struct{})
+	wc := newWarningsCapture()
 
-	var warnings []*VertexWarning
-	vertexes := map[digest.Digest]struct{}{}
-
-	go func() {
-		defer close(statusDone)
-		for {
-			select {
-			case st, ok := <-status:
-				if !ok {
-					return
-				}
-				for _, s := range st.Vertexes {
-					vertexes[s.Digest] = struct{}{}
-				}
-				warnings = append(warnings, st.Warnings...)
-			case <-done:
-				return
-			}
-		}
-	}()
-
-	_, err = c.Build(ctx, SolveOpt{}, product, b, status)
+	_, err = c.Build(ctx, SolveOpt{}, product, b, wc.status)
 	require.NoError(t, err)
 
-	select {
-	case <-statusDone:
-	case <-time.After(10 * time.Second):
-		close(done)
-	}
+	warnings := wc.wait()
 
-	<-statusDone
-
-	require.Equal(t, 1, len(vertexes))
+	require.Equal(t, 1, len(wc.vertexes))
 	require.Equal(t, 1, len(warnings))
 
 	w := warnings[0]
@@ -253,7 +227,7 @@ func testWarnings(t *testing.T, sb integration.Sandbox) {
 	require.Equal(t, "and more detail", string(w.Detail[1]))
 	require.Equal(t, "https://example.com", w.URL)
 	require.Equal(t, 3, w.Level)
-	_, ok := vertexes[w.Vertex]
+	_, ok := wc.vertexes[w.Vertex]
 	require.True(t, ok)
 
 	require.Equal(t, "mydockerfile", w.SourceInfo.Filename)
@@ -335,6 +309,7 @@ func testUnknownBuildID(t *testing.T, sb integration.Sandbox) {
 	_, err = g.Ping(ctx, &gatewayapi.PingRequest{})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "no such job")
+	require.Equal(t, codes.NotFound, grpcerrors.Code(err))
 }
 
 // testClientGatewayContainerCancelOnRelease is testing that all running
@@ -447,7 +422,6 @@ func testClientGatewayContainerExecPipe(t *testing.T, sb integration.Sandbox) {
 				Ref:       r.Ref,
 			}},
 		})
-
 		if err != nil {
 			return nil, err
 		}
@@ -457,13 +431,13 @@ func testClientGatewayContainerExecPipe(t *testing.T, sb integration.Sandbox) {
 			Args: []string{"sleep", "10"},
 		})
 		if err != nil {
-			ctr.Release(ctx)
+			ctr.Release(context.WithoutCancel(ctx))
 			return nil, err
 		}
 
 		defer func() {
 			// cancel pid1
-			ctr.Release(ctx)
+			ctr.Release(context.WithoutCancel(ctx))
 			pid1.Wait()
 		}()
 
@@ -478,7 +452,6 @@ func testClientGatewayContainerExecPipe(t *testing.T, sb integration.Sandbox) {
 			Stdin:  io.NopCloser(stdin2),
 			Stdout: stdout2,
 		})
-
 		if err != nil {
 			return nil, err
 		}
@@ -571,7 +544,6 @@ func testClientGatewayContainerPID1Fail(t *testing.T, sb integration.Sandbox) {
 				Ref:       r.Ref,
 			}},
 		})
-
 		if err != nil {
 			return nil, err
 		}
@@ -635,7 +607,6 @@ func testClientGatewayContainerPID1Exit(t *testing.T, sb integration.Sandbox) {
 				Ref:       r.Ref,
 			}},
 		})
-
 		if err != nil {
 			return nil, err
 		}
@@ -687,17 +658,14 @@ func testClientGatewayContainerMounts(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 	defer c.Close()
 
-	tmpdir, err := os.MkdirTemp("", "buildkit-buildctl")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := integration.Tmpdir(t)
 
-	err = os.WriteFile(filepath.Join(tmpdir, "local-file"), []byte("local"), 0644)
+	err = os.WriteFile(filepath.Join(tmpdir.Name, "local-file"), []byte("local"), 0644)
 	require.NoError(t, err)
 
 	a := agent.NewKeyring()
-	sockPath, clean, err := makeSSHAgentSock(a)
+	sockPath, err := makeSSHAgentSock(t, a)
 	require.NoError(t, err)
-	defer clean()
 
 	ssh, err := sshprovider.NewSSHAgentProvider([]sshprovider.AgentConfig{{
 		ID:    t.Name(),
@@ -833,7 +801,7 @@ func testClientGatewayContainerMounts(t *testing.T, sb integration.Sandbox) {
 	}
 
 	_, err = c.Build(ctx, SolveOpt{
-		LocalDirs: map[string]string{
+		LocalMounts: map[string]fsutil.FS{
 			"mylocal": tmpdir,
 		},
 		Session: []session.Attachable{
@@ -845,6 +813,75 @@ func testClientGatewayContainerMounts(t *testing.T, sb integration.Sandbox) {
 	}, product, b, nil)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), context.Canceled.Error())
+
+	checkAllReleasable(t, c, sb, true)
+}
+
+func testClientGatewayContainerSecretEnv(t *testing.T, sb integration.Sandbox) {
+	requiresLinux(t)
+
+	ctx := sb.Context()
+
+	c, err := New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	product := "buildkit_test"
+
+	b := func(ctx context.Context, c client.Client) (*client.Result, error) {
+		mounts := map[string]llb.State{
+			"/": llb.Image("busybox:latest"),
+		}
+
+		var containerMounts []client.Mount
+		for mountpoint, st := range mounts {
+			def, err := st.Marshal(ctx)
+			if err != nil {
+				return nil, errors.Wrap(err, "failed to marshal state")
+			}
+
+			r, err := c.Solve(ctx, client.SolveRequest{
+				Definition: def.ToPB(),
+			})
+			if err != nil {
+				return nil, errors.Wrap(err, "failed to solve")
+			}
+			containerMounts = append(containerMounts, client.Mount{
+				Dest:      mountpoint,
+				MountType: pb.MountType_BIND,
+				Ref:       r.Ref,
+			})
+		}
+
+		ctr, err := c.NewContainer(ctx, client.NewContainerRequest{Mounts: containerMounts})
+		if err != nil {
+			return nil, err
+		}
+
+		pid, err := ctr.Start(ctx, client.StartRequest{
+			Args: []string{"sh", "-c", "test $SOME_SECRET = foo-secret"},
+			SecretEnv: []*pb.SecretEnv{
+				{
+					ID:   "sekrit",
+					Name: "SOME_SECRET",
+				},
+			},
+		})
+		require.NoError(t, err)
+		err = pid.Wait()
+		require.NoError(t, err)
+
+		return &client.Result{}, ctr.Release(ctx)
+	}
+
+	_, err = c.Build(ctx, SolveOpt{
+		Session: []session.Attachable{
+			secretsprovider.FromMap(map[string][]byte{
+				"sekrit": []byte("foo-secret"),
+			}),
+		},
+	}, product, b, nil)
+	require.NoError(t, err)
 
 	checkAllReleasable(t, c, sb, true)
 }
@@ -865,7 +902,7 @@ func testClientGatewayContainerPID1Tty(t *testing.T, sb integration.Sandbox) {
 	output := bytes.NewBuffer(nil)
 
 	b := func(ctx context.Context, c client.Client) (*client.Result, error) {
-		ctx, timeout := context.WithTimeout(ctx, 10*time.Second)
+		ctx, timeout := context.WithTimeoutCause(ctx, 10*time.Second, nil)
 		defer timeout()
 
 		st := llb.Image("busybox:latest")
@@ -918,6 +955,77 @@ func testClientGatewayContainerPID1Tty(t *testing.T, sb integration.Sandbox) {
 		var exitError *gatewayapi.ExitError
 		require.ErrorAs(t, err, &exitError)
 		require.Equal(t, uint32(99), exitError.ExitCode)
+
+		return &client.Result{}, err
+	}
+
+	_, err = c.Build(ctx, SolveOpt{}, product, b, nil)
+	require.Error(t, err)
+
+	inputW.Close()
+	inputR.Close()
+
+	checkAllReleasable(t, c, sb, true)
+}
+
+// testClientGatewayContainerCancelPID1Tty is testing that the tty will cleanly
+// shutdown on context cancel
+func testClientGatewayContainerCancelPID1Tty(t *testing.T, sb integration.Sandbox) {
+	requiresLinux(t)
+	ctx := sb.Context()
+
+	c, err := New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	product := "buildkit_test"
+
+	inputR, inputW := io.Pipe()
+	output := bytes.NewBuffer(nil)
+
+	b := func(ctx context.Context, c client.Client) (*client.Result, error) {
+		ctx, cancel := context.WithTimeoutCause(ctx, 10*time.Second, nil)
+		defer cancel()
+
+		st := llb.Image("busybox:latest")
+
+		def, err := st.Marshal(ctx)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to marshal state")
+		}
+
+		r, err := c.Solve(ctx, client.SolveRequest{
+			Definition: def.ToPB(),
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to solve")
+		}
+
+		ctr, err := c.NewContainer(ctx, client.NewContainerRequest{
+			Mounts: []client.Mount{{
+				Dest:      "/",
+				MountType: pb.MountType_BIND,
+				Ref:       r.Ref,
+			}},
+		})
+		require.NoError(t, err)
+		defer ctr.Release(ctx)
+
+		prompt := newTestPrompt(ctx, t, inputW, output)
+		pid1, err := ctr.Start(ctx, client.StartRequest{
+			Args:   []string{"sh"},
+			Tty:    true,
+			Stdin:  inputR,
+			Stdout: &nopCloser{output},
+			Stderr: &nopCloser{output},
+			Env:    []string{fmt.Sprintf("PS1=%s", prompt.String())},
+		})
+		require.NoError(t, err)
+		prompt.SendExpect("echo hi", "hi")
+		cancel()
+
+		err = pid1.Wait()
+		require.ErrorIs(t, err, context.Canceled)
 
 		return &client.Result{}, err
 	}
@@ -1002,7 +1110,7 @@ func testClientGatewayContainerExecTty(t *testing.T, sb integration.Sandbox) {
 	inputR, inputW := io.Pipe()
 	output := bytes.NewBuffer(nil)
 	b := func(ctx context.Context, c client.Client) (*client.Result, error) {
-		ctx, timeout := context.WithTimeout(ctx, 10*time.Second)
+		ctx, timeout := context.WithTimeoutCause(ctx, 10*time.Second, nil)
 		defer timeout()
 		st := llb.Image("busybox:latest")
 
@@ -1072,6 +1180,87 @@ func testClientGatewayContainerExecTty(t *testing.T, sb integration.Sandbox) {
 	require.ErrorAs(t, err, &exitError)
 	require.Equal(t, uint32(99), exitError.ExitCode)
 	require.Regexp(t, "exit code: 99", err.Error())
+
+	inputW.Close()
+	inputR.Close()
+
+	checkAllReleasable(t, c, sb, true)
+}
+
+// testClientGatewayContainerCancelExecTty is testing the tty shuts down cleanly
+// on context.Cancel
+func testClientGatewayContainerCancelExecTty(t *testing.T, sb integration.Sandbox) {
+	requiresLinux(t)
+	ctx := sb.Context()
+
+	c, err := New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	product := "buildkit_test"
+
+	inputR, inputW := io.Pipe()
+	output := bytes.NewBuffer(nil)
+	b := func(ctx context.Context, c client.Client) (*client.Result, error) {
+		ctx, timeout := context.WithTimeoutCause(ctx, 10*time.Second, nil)
+		defer timeout()
+		st := llb.Image("busybox:latest")
+
+		def, err := st.Marshal(ctx)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to marshal state")
+		}
+
+		r, err := c.Solve(ctx, client.SolveRequest{
+			Definition: def.ToPB(),
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to solve")
+		}
+
+		ctr, err := c.NewContainer(ctx, client.NewContainerRequest{
+			Mounts: []client.Mount{{
+				Dest:      "/",
+				MountType: pb.MountType_BIND,
+				Ref:       r.Ref,
+			}},
+		})
+		require.NoError(t, err)
+
+		pid1, err := ctr.Start(ctx, client.StartRequest{
+			Args: []string{"sleep", "10"},
+		})
+		require.NoError(t, err)
+
+		defer pid1.Wait()
+		defer ctr.Release(ctx)
+
+		execCtx, cancel := context.WithCancelCause(ctx)
+		defer func() { cancel(errors.WithStack(context.Canceled)) }()
+
+		prompt := newTestPrompt(execCtx, t, inputW, output)
+		pid2, err := ctr.Start(execCtx, client.StartRequest{
+			Args:   []string{"sh"},
+			Tty:    true,
+			Stdin:  inputR,
+			Stdout: &nopCloser{output},
+			Stderr: &nopCloser{output},
+			Env:    []string{fmt.Sprintf("PS1=%s", prompt.String())},
+		})
+		require.NoError(t, err)
+
+		prompt.SendExpect("echo hi", "hi")
+		cancel(errors.WithStack(context.Canceled))
+
+		err = pid2.Wait()
+		require.ErrorIs(t, err, context.Canceled)
+
+		return &client.Result{}, err
+	}
+
+	_, err = c.Build(ctx, SolveOpt{}, product, b, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), context.Canceled.Error())
 
 	inputW.Close()
 	inputR.Close()
@@ -1239,28 +1428,32 @@ func testClientGatewayExecError(t *testing.T, sb integration.Sandbox) {
 			llb.Image("busybox:latest").Run(
 				llb.Shlexf(`sh -c "echo %s > /data && fail"`, id),
 			).Root(),
-			1, []string{"/data"},
+			1,
+			[]string{"/data"},
 		}, {
 			"rootfs and readwrite scratch mount",
 			llb.Image("busybox:latest").Run(
 				llb.Shlexf(`sh -c "echo %s > /data && echo %s > /rw/data && fail"`, id, id),
 				llb.AddMount("/rw", llb.Scratch()),
 			).Root(),
-			2, []string{"/data", "/rw/data"},
+			2,
+			[]string{"/data", "/rw/data"},
 		}, {
 			"rootfs and readwrite mount",
 			llb.Image("busybox:latest").Run(
 				llb.Shlexf(`sh -c "echo %s > /data && echo %s > /rw/data && fail"`, id, id),
 				llb.AddMount("/rw", llb.Scratch().File(llb.Mkfile("foo", 0700, []byte(id)))),
 			).Root(),
-			2, []string{"/data", "/rw/data", "/rw/foo"},
+			2,
+			[]string{"/data", "/rw/data", "/rw/foo"},
 		}, {
 			"rootfs and readonly scratch mount",
 			llb.Image("busybox:latest").Run(
 				llb.Shlexf(`sh -c "echo %s > /data && echo %s > /readonly/foo"`, id, id),
 				llb.AddMount("/readonly", llb.Scratch(), llb.Readonly),
 			).Root(),
-			2, []string{"/data"},
+			2,
+			[]string{"/data"},
 		}, {
 			"rootfs and readwrite force no output mount",
 			llb.Image("busybox:latest").Run(
@@ -1271,7 +1464,8 @@ func testClientGatewayExecError(t *testing.T, sb integration.Sandbox) {
 					llb.ForceNoOutput,
 				),
 			).Root(),
-			2, []string{"/data", "/rw/data", "/rw/foo"},
+			2,
+			[]string{"/data", "/rw/data", "/rw/foo"},
 		}}
 
 		for _, tt := range tests {
@@ -1620,9 +1814,18 @@ func testClientGatewayExecFileActionError(t *testing.T, sb integration.Sandbox) 
 	checkAllReleasable(t, c, sb, true)
 }
 
-// testClientGatewayContainerSecurityMode ensures that the correct security mode
+// testClientGatewayContainerSecurityModeCaps ensures that the correct security mode
 // is propagated to the gateway container
-func testClientGatewayContainerSecurityMode(t *testing.T, sb integration.Sandbox) {
+func testClientGatewayContainerSecurityModeCaps(t *testing.T, sb integration.Sandbox) {
+	testClientGatewayContainerSecurityMode(t, sb, false)
+}
+
+func testClientGatewayContainerSecurityModeValidation(t *testing.T, sb integration.Sandbox) {
+	testClientGatewayContainerSecurityMode(t, sb, true)
+}
+
+func testClientGatewayContainerSecurityMode(t *testing.T, sb integration.Sandbox, expectFail bool) {
+	workers.CheckFeatureCompat(t, sb, workers.FeatureSecurityMode)
 	requiresLinux(t)
 
 	ctx := sb.Context()
@@ -1635,7 +1838,7 @@ func testClientGatewayContainerSecurityMode(t *testing.T, sb integration.Sandbox
 
 	command := []string{"sh", "-c", `cat /proc/self/status | grep CapEff | cut -f 2`}
 	mode := llb.SecurityModeSandbox
-	var allowedEntitlements []entitlements.Entitlement
+	var allowedEntitlements []string
 	var assertCaps func(caps uint64)
 	secMode := sb.Value("secmode")
 	if secMode == securitySandbox {
@@ -1645,11 +1848,13 @@ func testClientGatewayContainerSecurityMode(t *testing.T, sb integration.Sandbox
 				0x00000000a80425fb=cap_chown,cap_dac_override,cap_fowner,cap_fsetid,cap_kill,cap_setgid,cap_setuid,cap_setpcap,
 				cap_net_bind_service,cap_net_raw,cap_sys_chroot,cap_mknod,cap_audit_write,cap_setfcap
 			*/
-			require.EqualValues(t, 0xa80425fb, caps)
+			require.Equal(t, uint64(0xa80425fb), caps)
 		}
-		allowedEntitlements = []entitlements.Entitlement{}
+		allowedEntitlements = []string{}
+		if expectFail {
+			return
+		}
 	} else {
-		integration.SkipIfDockerd(t, sb)
 		assertCaps = func(caps uint64) {
 			/*
 				$ capsh --decode=0000003fffffffff
@@ -1661,10 +1866,13 @@ func testClientGatewayContainerSecurityMode(t *testing.T, sb integration.Sandbox
 			*/
 
 			// require that _at least_ minimum capabilities are granted
-			require.EqualValues(t, 0x3fffffffff, caps&0x3fffffffff)
+			require.Equal(t, uint64(0x3fffffffff), caps&0x3fffffffff)
 		}
 		mode = llb.SecurityModeInsecure
-		allowedEntitlements = []entitlements.Entitlement{entitlements.EntitlementSecurityInsecure}
+		allowedEntitlements = []string{entitlements.EntitlementSecurityInsecure.String()}
+		if expectFail {
+			allowedEntitlements = []string{}
+		}
 	}
 
 	b := func(ctx context.Context, c client.Client) (*client.Result, error) {
@@ -1689,7 +1897,6 @@ func testClientGatewayContainerSecurityMode(t *testing.T, sb integration.Sandbox
 				Ref:       r.Ref,
 			}},
 		})
-
 		if err != nil {
 			return nil, err
 		}
@@ -1714,6 +1921,12 @@ func testClientGatewayContainerSecurityMode(t *testing.T, sb integration.Sandbox
 		t.Logf("Stdout: %q", stdout.String())
 		t.Logf("Stderr: %q", stderr.String())
 
+		if expectFail {
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "security.insecure is not allowed")
+			return nil, err
+		}
+
 		require.NoError(t, err)
 
 		capsValue, err := strconv.ParseUint(strings.TrimSpace(stdout.String()), 16, 64)
@@ -1728,7 +1941,13 @@ func testClientGatewayContainerSecurityMode(t *testing.T, sb integration.Sandbox
 		AllowedEntitlements: allowedEntitlements,
 	}
 	_, err = c.Build(ctx, solveOpts, product, b, nil)
-	require.NoError(t, err)
+
+	if expectFail {
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "security.insecure is not allowed")
+	} else {
+		require.NoError(t, err)
+	}
 
 	checkAllReleasable(t, c, sb, true)
 }
@@ -1769,7 +1988,6 @@ func testClientGatewayContainerExtraHosts(t *testing.T, sb integration.Sandbox) 
 				IP:   "169.254.11.22",
 			}},
 		})
-
 		if err != nil {
 			return nil, err
 		}
@@ -1804,7 +2022,15 @@ func testClientGatewayContainerExtraHosts(t *testing.T, sb integration.Sandbox) 
 	checkAllReleasable(t, c, sb, true)
 }
 
-func testClientGatewayContainerHostNetworking(t *testing.T, sb integration.Sandbox) {
+func testClientGatewayContainerHostNetworkingAccess(t *testing.T, sb integration.Sandbox) {
+	testClientGatewayContainerHostNetworking(t, sb, false)
+}
+
+func testClientGatewayContainerHostNetworkingValidation(t *testing.T, sb integration.Sandbox) {
+	testClientGatewayContainerHostNetworking(t, sb, true)
+}
+
+func testClientGatewayContainerHostNetworking(t *testing.T, sb integration.Sandbox, expectFail bool) {
 	if os.Getenv("BUILDKIT_RUN_NETWORK_INTEGRATION_TESTS") == "" {
 		t.SkipNow()
 	}
@@ -1820,11 +2046,14 @@ func testClientGatewayContainerHostNetworking(t *testing.T, sb integration.Sandb
 	ctx := sb.Context()
 	product := "buildkit_test"
 
-	var allowedEntitlements []entitlements.Entitlement
+	var allowedEntitlements []string
 	netMode := pb.NetMode_UNSET
 	if sb.Value("netmode") == hostNetwork {
 		netMode = pb.NetMode_HOST
-		allowedEntitlements = []entitlements.Entitlement{entitlements.EntitlementNetworkHost}
+		allowedEntitlements = []string{entitlements.EntitlementNetworkHost.String()}
+		if expectFail {
+			allowedEntitlements = []string{}
+		}
 	}
 	c, err := New(sb.Context(), sb.Address())
 	require.NoError(t, err)
@@ -1858,7 +2087,6 @@ func testClientGatewayContainerHostNetworking(t *testing.T, sb integration.Sandb
 			}},
 			NetMode: netMode,
 		})
-
 		if err != nil {
 			return nil, err
 		}
@@ -1883,7 +2111,12 @@ func testClientGatewayContainerHostNetworking(t *testing.T, sb integration.Sandb
 		t.Logf("Stderr: %q", stderr.String())
 
 		if netMode == pb.NetMode_HOST {
-			require.NoError(t, err)
+			if expectFail {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "network.host is not allowed")
+			} else {
+				require.NoError(t, err)
+			}
 		} else {
 			require.Error(t, err)
 		}
@@ -1912,7 +2145,7 @@ func testClientGatewayContainerSignal(t *testing.T, sb integration.Sandbox) {
 	product := "buildkit_test"
 
 	b := func(ctx context.Context, c client.Client) (*client.Result, error) {
-		ctx, timeout := context.WithTimeout(ctx, 10*time.Second)
+		ctx, timeout := context.WithTimeoutCause(ctx, 10*time.Second, nil)
 		defer timeout()
 
 		st := llb.Image("busybox:latest")
@@ -1998,62 +2231,88 @@ func testClientGatewayContainerSignal(t *testing.T, sb integration.Sandbox) {
 	checkAllReleasable(t, c, sb, true)
 }
 
-// moby/buildkit#2476
-func testClientGatewayFrontendAttrs(t *testing.T, sb integration.Sandbox) {
+func testClientGatewayNilResult(t *testing.T, sb integration.Sandbox) {
+	workers.CheckFeatureCompat(t, sb, workers.FeatureMergeDiff)
 	requiresLinux(t)
 	c, err := New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	fooattrval := "bar"
-	bazattrval := "fuu"
-
 	b := func(ctx context.Context, c client.Client) (*client.Result, error) {
-		st := llb.Image("busybox:latest").Run(
-			llb.ReadonlyRootFS(),
-			llb.Args([]string{"/bin/sh", "-c", `echo hello`}),
-		)
-		def, err := st.Marshal(sb.Context())
+		st := llb.Image("busybox:latest")
+		diff := llb.Diff(st, st)
+		def, err := diff.Marshal(sb.Context())
 		if err != nil {
 			return nil, err
 		}
 		res, err := c.Solve(ctx, client.SolveRequest{
 			Definition: def.ToPB(),
-			FrontendOpt: map[string]string{
-				"build-arg:foo": fooattrval,
-			},
+			Evaluate:   true,
 		})
 		require.NoError(t, err)
-		require.Contains(t, res.Metadata, exptypes.ExporterBuildInfo)
 
-		var bi binfotypes.BuildInfo
-		require.NoError(t, json.Unmarshal(res.Metadata[exptypes.ExporterBuildInfo], &bi))
-		require.Contains(t, bi.Attrs, "build-arg:foo")
-		bi.Attrs["build-arg:baz"] = &bazattrval
-
-		bmbi, err := json.Marshal(bi)
+		ref, err := res.SingleRef()
 		require.NoError(t, err)
 
-		res.AddMeta(exptypes.ExporterBuildInfo, bmbi)
-		return res, err
+		dirEnts, err := ref.ReadDir(ctx, client.ReadDirRequest{
+			Path: "/",
+		})
+		require.NoError(t, err)
+		require.Len(t, dirEnts, 0)
+		return nil, nil
 	}
 
-	res, err := c.Build(sb.Context(), SolveOpt{}, "", b, nil)
+	_, err = c.Build(sb.Context(), SolveOpt{}, "", b, nil)
+	require.NoError(t, err)
+}
+
+func testClientGatewayEmptyImageExec(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
+	workers.CheckFeatureCompat(t, sb, workers.FeatureDirectPush)
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	registry, err := sb.NewRegistry()
+	if errors.Is(err, integration.ErrRequirements) {
+		t.Skip(err.Error())
+	}
+	require.NoError(t, err)
+	target := registry + "/buildkit/testemptyimage:latest"
+
+	// push an empty image
+	_, err = c.Build(sb.Context(), SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type: ExporterImage,
+				Attrs: map[string]string{
+					"name": target,
+					"push": "true",
+				},
+			},
+		},
+	}, "", func(ctx context.Context, c client.Client) (*client.Result, error) {
+		return client.NewResult(), nil
+	}, nil)
 	require.NoError(t, err)
 
-	require.Contains(t, res.ExporterResponse, exptypes.ExporterBuildInfo)
-	decbi, err := base64.StdEncoding.DecodeString(res.ExporterResponse[exptypes.ExporterBuildInfo])
+	_, err = c.Build(sb.Context(), SolveOpt{}, "", func(ctx context.Context, gw client.Client) (*client.Result, error) {
+		// create an exec on that empty image (expected to fail, but not to panic)
+		st := llb.Image(target).Run(
+			llb.Args([]string{"echo", "hello"}),
+		).Root()
+		def, err := st.Marshal(sb.Context())
+		if err != nil {
+			return nil, err
+		}
+		_, err = gw.Solve(ctx, client.SolveRequest{
+			Definition: def.ToPB(),
+			Evaluate:   true,
+		})
+		require.ErrorContains(t, err, `process "echo hello" did not complete successfully`)
+		return nil, nil
+	}, nil)
 	require.NoError(t, err)
-
-	var bi binfotypes.BuildInfo
-	require.NoError(t, json.Unmarshal(decbi, &bi))
-
-	require.Contains(t, bi.Attrs, "build-arg:foo")
-	require.Equal(t, &fooattrval, bi.Attrs["build-arg:foo"])
-	require.Contains(t, bi.Attrs, "build-arg:baz")
-	require.Equal(t, &bazattrval, bi.Attrs["build-arg:baz"])
-
-	checkAllReleasable(t, c, sb, true)
 }
 
 type nopCloser struct {

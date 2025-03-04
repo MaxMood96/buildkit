@@ -64,22 +64,25 @@ func TestCommandsTooManyArguments(t *testing.T) {
 		"LABEL",
 	}
 
-	for _, command := range commands {
+	for _, cmd := range commands {
 		node := &parser.Node{
-			Original: command + "arg1 arg2 arg3",
-			Value:    strings.ToLower(command),
+			Original: cmd + "arg1 arg2 arg3",
+			Value:    strings.ToLower(cmd),
 			Next: &parser.Node{
 				Value: "arg1",
 				Next: &parser.Node{
 					Value: "arg2",
 					Next: &parser.Node{
 						Value: "arg3",
+						Next: &parser.Node{
+							Value: "",
+						},
 					},
 				},
 			},
 		}
 		_, err := ParseInstruction(node)
-		require.EqualError(t, err, errTooManyArguments(command).Error())
+		require.EqualError(t, err, errTooManyArguments(cmd).Error())
 	}
 }
 
@@ -97,6 +100,9 @@ func TestCommandsBlankNames(t *testing.T) {
 				Value: "",
 				Next: &parser.Node{
 					Value: "arg2",
+					Next: &parser.Node{
+						Value: "=",
+					},
 				},
 			},
 		}
@@ -136,9 +142,37 @@ func TestParseOptInterval(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "cannot be less than 1ms")
 
+	flInterval.Value = "0ms"
+	_, err = parseOptInterval(flInterval)
+	require.NoError(t, err)
+
 	flInterval.Value = "1ms"
 	_, err = parseOptInterval(flInterval)
 	require.NoError(t, err)
+}
+
+func TestNilLinter(t *testing.T) {
+	for cmd := range command.Commands {
+		cmd := cmd
+		t.Run(cmd, func(t *testing.T) {
+			t.Parallel()
+
+			for _, tc := range []string{
+				cmd + " foo=bar",
+				cmd + " a",
+				cmd + " a b",
+				cmd + " a b c",
+				cmd + " 0 0",
+			} {
+				t.Run(tc, func(t *testing.T) {
+					ast, err := parser.Parse(strings.NewReader("FROM busybox\n" + tc))
+					if err == nil {
+						_, _, _ = Parse(ast.AST, nil)
+					}
+				})
+			}
+		})
+	}
 }
 
 func TestCommentsDetection(t *testing.T) {
@@ -157,7 +191,7 @@ ARG bar baz=123
 	ast, err := parser.Parse(bytes.NewBuffer([]byte(dt)))
 	require.NoError(t, err)
 
-	stages, meta, err := Parse(ast.AST)
+	stages, meta, err := Parse(ast.AST, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, "defines first stage", stages[0].Comment)
@@ -195,7 +229,7 @@ func TestErrorCases(t *testing.T) {
 		{
 			name:          "MAINTAINER unknown flag",
 			dockerfile:    "MAINTAINER --boo joe@example.com",
-			expectedError: "unknown flag: boo",
+			expectedError: "unknown flag: --boo",
 		},
 		{
 			name:          "Chaining ONBUILD",
@@ -222,8 +256,7 @@ func TestErrorCases(t *testing.T) {
 		}
 		n := ast.AST.Children[0]
 		_, err = ParseInstruction(n)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), c.expectedError)
+		require.ErrorContains(t, err, c.expectedError)
 	}
 }
 
@@ -236,6 +269,16 @@ func TestRunCmdFlagsUsed(t *testing.T) {
 	n := ast.AST.Children[0]
 	c, err := ParseInstruction(n)
 	require.NoError(t, err)
-	require.IsType(t, c, &RunCommand{})
+	require.IsType(t, &RunCommand{}, c)
 	require.Equal(t, []string{"mount"}, c.(*RunCommand).FlagsUsed)
+}
+
+func BenchmarkParseBuildStageName(b *testing.B) {
+	b.ReportAllocs()
+	stageNames := []string{"STAGE_NAME", "StageName", "St4g3N4m3"}
+	for i := 0; i < b.N; i++ {
+		for _, s := range stageNames {
+			_, _ = parseBuildStageName([]string{"foo", "as", s})
+		}
+	}
 }

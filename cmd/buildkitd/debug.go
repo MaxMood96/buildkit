@@ -2,12 +2,15 @@ package main
 
 import (
 	"expvar"
-	"net"
 	"net/http"
 	"net/http/pprof"
+	"os"
 	"runtime"
+	"strings"
+	"time"
 
-	"github.com/sirupsen/logrus"
+	"github.com/moby/buildkit/util/bklog"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/net/trace"
 )
 
@@ -24,19 +27,35 @@ func setupDebugHandlers(addr string) error {
 
 	m.Handle("/debug/gc", http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		runtime.GC()
-		logrus.Debugf("triggered GC from debug endpoint")
+		bklog.G(req.Context()).Debugf("triggered GC from debug endpoint")
 	}))
+
+	m.Handle("/metrics", promhttp.Handler())
+
+	setupDebugFlight(m)
 
 	// setting debugaddr is opt-in. permission is defined by listener address
 	trace.AuthRequest = func(_ *http.Request) (bool, bool) {
 		return true, true
 	}
 
-	l, err := net.Listen("tcp", addr)
+	if !strings.Contains(addr, "://") {
+		addr = "tcp://" + addr
+	}
+	l, err := getListener(addr, os.Getuid(), os.Getgid(), "", nil, false)
 	if err != nil {
 		return err
 	}
-	logrus.Debugf("debug handlers listening at %s", addr)
-	go http.Serve(l, m)
+	server := &http.Server{
+		Addr:              l.Addr().String(),
+		Handler:           m,
+		ReadHeaderTimeout: time.Minute,
+	}
+	bklog.L.Debugf("debug handlers listening at %s", addr)
+	go func() {
+		if err := server.Serve(l); err != nil {
+			bklog.L.Errorf("failed to serve debug handlers: %v", err)
+		}
+	}()
 	return nil
 }

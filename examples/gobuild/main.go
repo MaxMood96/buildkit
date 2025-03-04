@@ -1,5 +1,4 @@
 //go:build ignore
-// +build ignore
 
 package main
 
@@ -36,7 +35,7 @@ func run() error {
 		Source:    src,
 		MountPath: "/go/src/github.com/moby/buildkit",
 		Pkg:       "github.com/moby/buildkit/cmd/buildkitd",
-		BuildTags: []string{"no_containerd_worker"},
+		BuildTags: []string{},
 	})
 	if err != nil {
 		return err
@@ -44,9 +43,9 @@ func run() error {
 	_ = buildkitd
 
 	containerd, err := gb.BuildExe(gobuild.BuildOpt{
-		Source:    llb.Git("github.com/containerd/containerd", "v1.2.7"),
+		Source:    llb.Git("github.com/containerd/containerd/v2/client", "v1.2.7"),
 		MountPath: "/go/src/github.com/containerd/containerd",
-		Pkg:       "github.com/containerd/containerd/cmd/containerd",
+		Pkg:       "github.com/containerd/containerd/v2/cmd/containerd",
 		BuildTags: []string{"no_btrfs"},
 	})
 	if err != nil {

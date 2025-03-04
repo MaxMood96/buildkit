@@ -18,19 +18,21 @@ import (
 	"testing"
 	"time"
 
-	ctdcompression "github.com/containerd/containerd/archive/compression"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/content/local"
-	"github.com/containerd/containerd/diff/apply"
-	"github.com/containerd/containerd/diff/walking"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/leases"
-	ctdmetadata "github.com/containerd/containerd/metadata"
-	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/snapshots"
-	"github.com/containerd/containerd/snapshots/native"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/diff/apply"
+	"github.com/containerd/containerd/v2/core/leases"
+	ctdmetadata "github.com/containerd/containerd/v2/core/metadata"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/core/snapshots"
+	ctdcompression "github.com/containerd/containerd/v2/pkg/archive/compression"
+	"github.com/containerd/containerd/v2/pkg/archive/tarheader"
+	"github.com/containerd/containerd/v2/pkg/labels"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/plugins/content/local"
+	"github.com/containerd/containerd/v2/plugins/diff/walking"
+	"github.com/containerd/containerd/v2/plugins/snapshots/native"
 	"github.com/containerd/continuity/fs/fstest"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/containerd/stargz-snapshotter/estargz"
 	"github.com/klauspost/compress/zstd"
 	"github.com/moby/buildkit/cache/config"
@@ -42,7 +44,11 @@ import (
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/util/contentutil"
+	"github.com/moby/buildkit/util/converter"
+	"github.com/moby/buildkit/util/disk"
+	"github.com/moby/buildkit/util/iohelper"
 	"github.com/moby/buildkit/util/leaseutil"
+	"github.com/moby/buildkit/util/overlay"
 	"github.com/moby/buildkit/util/winlayers"
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
@@ -64,7 +70,7 @@ type cmOut struct {
 	cs      content.Store
 }
 
-func newCacheManager(ctx context.Context, opt cmOpt) (co *cmOut, cleanup func() error, err error) {
+func newCacheManager(ctx context.Context, t *testing.T, opt cmOpt) (co *cmOut, cleanup func(), err error) {
 	ns, ok := namespaces.Namespace(ctx)
 	if !ok {
 		return nil, nil, errors.Errorf("namespace required for test")
@@ -74,31 +80,24 @@ func newCacheManager(ctx context.Context, opt cmOpt) (co *cmOut, cleanup func() 
 		opt.snapshotterName = "native"
 	}
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	if err != nil {
-		return nil, nil, err
-	}
+	tmpdir := t.TempDir()
 
 	defers := make([]func() error, 0)
-	cleanup = func() error {
+	cleanup = func() {
 		var err error
 		for i := range defers {
 			if err1 := defers[len(defers)-1-i](); err1 != nil && err == nil {
 				err = err1
 			}
 		}
-		return err
+		require.NoError(t, err)
 	}
 	defer func() {
 		if err != nil && cleanup != nil {
 			cleanup()
 		}
 	}()
-	if opt.tmpdir == "" {
-		defers = append(defers, func() error {
-			return os.RemoveAll(tmpdir)
-		})
-	} else {
+	if opt.tmpdir != "" {
 		os.RemoveAll(tmpdir)
 		tmpdir = opt.tmpdir
 	}
@@ -141,6 +140,9 @@ func newCacheManager(ctx context.Context, opt cmOpt) (co *cmOut, cleanup func() 
 	if err != nil {
 		return nil, nil, err
 	}
+	defers = append(defers, func() error {
+		return md.Close()
+	})
 
 	cm, err := NewManager(ManagerOpt{
 		Snapshotter:    snapshot.FromContainerdSnapshotter(opt.snapshotterName, containerdsnapshot.NSSnapshotter(ns, mdb.Snapshotter(opt.snapshotterName)), nil),
@@ -150,11 +152,16 @@ func newCacheManager(ctx context.Context, opt cmOpt) (co *cmOut, cleanup func() 
 		GarbageCollect: mdb.GarbageCollect,
 		Applier:        applier,
 		Differ:         differ,
+		Root:           tmpdir,
 		MountPoolRoot:  filepath.Join(tmpdir, "cachemounts"),
 	})
 	if err != nil {
 		return nil, nil, err
 	}
+	defers = append(defers, func() error {
+		return cm.Close()
+	})
+
 	return &cmOut{
 		manager: cm,
 		lm:      lm,
@@ -166,22 +173,20 @@ func TestSharableMountPoolCleanup(t *testing.T) {
 	t.Parallel()
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	// Emulate the situation where the pool dir is dirty
 	mountPoolDir := filepath.Join(tmpdir, "cachemounts")
 	require.NoError(t, os.MkdirAll(mountPoolDir, 0700))
-	_, err = os.MkdirTemp(mountPoolDir, "buildkit")
+	_, err := os.MkdirTemp(mountPoolDir, "buildkit")
 	require.NoError(t, err)
 
 	// Initialize cache manager and check if pool is cleaned up
-	_, cleanup, err := newCacheManager(ctx, cmOpt{
+	_, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		tmpdir: tmpdir,
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 
 	files, err := os.ReadDir(mountPoolDir)
 	require.NoError(t, err)
@@ -193,20 +198,21 @@ func TestManager(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, snapshotter.Close())
+	})
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
+	t.Cleanup(cleanup)
 
-	defer cleanup()
 	cm := co.manager
 
 	_, err = cm.Get(ctx, "foobar", nil)
@@ -226,7 +232,7 @@ func TestManager(t *testing.T) {
 
 	fi, err := os.Stat(target)
 	require.NoError(t, err)
-	require.Equal(t, fi.IsDir(), true)
+	require.Equal(t, true, fi.IsDir())
 
 	err = lm.Unmount()
 	require.NoError(t, err)
@@ -311,7 +317,7 @@ func TestManager(t *testing.T) {
 
 	checkDiskUsage(ctx, t, cm, 0, 0)
 
-	require.Equal(t, len(buf.all), 2)
+	require.Equal(t, 2, len(buf.all))
 
 	err = cm.Close()
 	require.NoError(t, err)
@@ -325,19 +331,17 @@ func TestLazyGetByBlob(t *testing.T) {
 	t.Parallel()
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	cm := co.manager
 
 	// Test for #2226 https://github.com/moby/buildkit/issues/2226, create lazy blobs with the same diff ID but
@@ -370,19 +374,17 @@ func TestMergeBlobchainID(t *testing.T) {
 	t.Parallel()
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	cm := co.manager
 
 	// create a merge ref that has 3 inputs, with each input being a 3 layer blob chain
@@ -443,20 +445,17 @@ func TestSnapshotExtract(t *testing.T) {
 	t.Parallel()
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-
-	defer cleanup()
+	t.Cleanup(cleanup)
 
 	cm := co.manager
 
@@ -509,7 +508,7 @@ func TestSnapshotExtract(t *testing.T) {
 
 	checkDiskUsage(ctx, t, cm, 2, 0)
 
-	require.Equal(t, len(buf.all), 0)
+	require.Equal(t, 0, len(buf.all))
 
 	dirs, err = os.ReadDir(filepath.Join(tmpdir, "snapshots/snapshots"))
 	require.NoError(t, err)
@@ -550,7 +549,7 @@ func TestSnapshotExtract(t *testing.T) {
 
 	checkDiskUsage(ctx, t, cm, 1, 0)
 
-	require.Equal(t, len(buf.all), 1)
+	require.Equal(t, 1, len(buf.all))
 
 	dirs, err = os.ReadDir(filepath.Join(tmpdir, "snapshots/snapshots"))
 	require.NoError(t, err)
@@ -583,20 +582,17 @@ func TestExtractOnMutable(t *testing.T) {
 	t.Parallel()
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-
-	defer cleanup()
+	t.Cleanup(cleanup)
 
 	cm := co.manager
 
@@ -661,7 +657,7 @@ func TestExtractOnMutable(t *testing.T) {
 
 	checkDiskUsage(ctx, t, cm, 2, 0)
 
-	require.Equal(t, len(buf.all), 0)
+	require.Equal(t, 0, len(buf.all))
 
 	dirs, err = os.ReadDir(filepath.Join(tmpdir, "snapshots/snapshots"))
 	require.NoError(t, err)
@@ -679,7 +675,7 @@ func TestExtractOnMutable(t *testing.T) {
 
 	checkDiskUsage(ctx, t, cm, 0, 0)
 
-	require.Equal(t, len(buf.all), 2)
+	require.Equal(t, 2, len(buf.all))
 
 	dirs, err = os.ReadDir(filepath.Join(tmpdir, "snapshots/snapshots"))
 	require.NoError(t, err)
@@ -692,20 +688,20 @@ func TestSetBlob(t *testing.T) {
 	t.Parallel()
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, snapshotter.Close())
+	})
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-
-	defer cleanup()
+	t.Cleanup(cleanup)
 
 	ctx, done, err := leaseutil.WithLease(ctx, co.lm, leaseutil.MakeTemporary)
 	require.NoError(t, err)
@@ -724,7 +720,7 @@ func TestSetBlob(t *testing.T) {
 	require.Equal(t, "", string(snapRef.getBlob()))
 	require.Equal(t, "", string(snapRef.getChainID()))
 	require.Equal(t, "", string(snapRef.getBlobChainID()))
-	require.Equal(t, !snapRef.getBlobOnly(), true)
+	require.Equal(t, true, !snapRef.getBlobOnly())
 
 	ctx, clean, err := leaseutil.WithLease(ctx, co.lm)
 	require.NoError(t, err)
@@ -739,7 +735,7 @@ func TestSetBlob(t *testing.T) {
 	err = snap.(*immutableRef).setBlob(ctx, ocispecs.Descriptor{
 		Digest: digest.FromBytes([]byte("foobar")),
 		Annotations: map[string]string{
-			"containerd.io/uncompressed": digest.FromBytes([]byte("foobar2")).String(),
+			labels.LabelUncompressed: digest.FromBytes([]byte("foobar2")).String(),
 		},
 	})
 	require.Error(t, err)
@@ -750,13 +746,13 @@ func TestSetBlob(t *testing.T) {
 	require.NoError(t, err)
 
 	snapRef = snap.(*immutableRef)
-	require.Equal(t, desc.Annotations["containerd.io/uncompressed"], string(snapRef.getDiffID()))
+	require.Equal(t, desc.Annotations[labels.LabelUncompressed], string(snapRef.getDiffID()))
 	require.Equal(t, desc.Digest, snapRef.getBlob())
 	require.Equal(t, desc.MediaType, snapRef.getMediaType())
 	require.Equal(t, snapRef.getDiffID(), snapRef.getChainID())
 	require.Equal(t, digest.FromBytes([]byte(desc.Digest+" "+snapRef.getDiffID())), snapRef.getBlobChainID())
 	require.Equal(t, snap.ID(), snapRef.getSnapshotID())
-	require.Equal(t, !snapRef.getBlobOnly(), true)
+	require.Equal(t, true, !snapRef.getBlobOnly())
 
 	active, err = cm.New(ctx, snap, nil)
 	require.NoError(t, err)
@@ -776,13 +772,13 @@ func TestSetBlob(t *testing.T) {
 	require.NoError(t, err)
 
 	snapRef2 := snap2.(*immutableRef)
-	require.Equal(t, desc2.Annotations["containerd.io/uncompressed"], string(snapRef2.getDiffID()))
+	require.Equal(t, desc2.Annotations[labels.LabelUncompressed], string(snapRef2.getDiffID()))
 	require.Equal(t, desc2.Digest, snapRef2.getBlob())
 	require.Equal(t, desc2.MediaType, snapRef2.getMediaType())
 	require.Equal(t, digest.FromBytes([]byte(snapRef.getChainID()+" "+snapRef2.getDiffID())), snapRef2.getChainID())
 	require.Equal(t, digest.FromBytes([]byte(snapRef.getBlobChainID()+" "+digest.FromBytes([]byte(desc2.Digest+" "+snapRef2.getDiffID())))), snapRef2.getBlobChainID())
 	require.Equal(t, snap2.ID(), snapRef2.getSnapshotID())
-	require.Equal(t, !snapRef2.getBlobOnly(), true)
+	require.Equal(t, true, !snapRef2.getBlobOnly())
 
 	b3, desc3, err := mapToBlob(map[string]string{"foo3": "bar3"}, true)
 	require.NoError(t, err)
@@ -794,13 +790,13 @@ func TestSetBlob(t *testing.T) {
 	require.NoError(t, err)
 
 	snapRef3 := snap3.(*immutableRef)
-	require.Equal(t, desc3.Annotations["containerd.io/uncompressed"], string(snapRef3.getDiffID()))
+	require.Equal(t, desc3.Annotations[labels.LabelUncompressed], string(snapRef3.getDiffID()))
 	require.Equal(t, desc3.Digest, snapRef3.getBlob())
 	require.Equal(t, desc3.MediaType, snapRef3.getMediaType())
 	require.Equal(t, digest.FromBytes([]byte(snapRef.getChainID()+" "+snapRef3.getDiffID())), snapRef3.getChainID())
 	require.Equal(t, digest.FromBytes([]byte(snapRef.getBlobChainID()+" "+digest.FromBytes([]byte(desc3.Digest+" "+snapRef3.getDiffID())))), snapRef3.getBlobChainID())
 	require.Equal(t, string(snapRef3.getChainID()), snapRef3.getSnapshotID())
-	require.Equal(t, !snapRef3.getBlobOnly(), false)
+	require.Equal(t, false, !snapRef3.getBlobOnly())
 
 	// snap4 is same as snap2
 	snap4, err := cm.GetByBlob(ctx, desc2, snap)
@@ -812,7 +808,7 @@ func TestSetBlob(t *testing.T) {
 	b5, desc5, err := mapToBlob(map[string]string{"foo5": "bar5"}, true)
 	require.NoError(t, err)
 
-	desc5.Annotations["containerd.io/uncompressed"] = snapRef2.getDiffID().String()
+	desc5.Annotations[labels.LabelUncompressed] = snapRef2.getDiffID().String()
 
 	err = content.WriteBlob(ctx, co.cs, "ref5", bytes.NewBuffer(b5), desc5)
 	require.NoError(t, err)
@@ -841,44 +837,45 @@ func TestSetBlob(t *testing.T) {
 	require.NoError(t, err)
 
 	snapRef6 := snap6.(*immutableRef)
-	require.Equal(t, desc6.Annotations["containerd.io/uncompressed"], string(snapRef6.getDiffID()))
+	require.Equal(t, desc6.Annotations[labels.LabelUncompressed], string(snapRef6.getDiffID()))
 	require.Equal(t, desc6.Digest, snapRef6.getBlob())
 	require.Equal(t, digest.FromBytes([]byte(snapRef3.getChainID()+" "+snapRef6.getDiffID())), snapRef6.getChainID())
 	require.Equal(t, digest.FromBytes([]byte(snapRef3.getBlobChainID()+" "+digest.FromBytes([]byte(snapRef6.getBlob()+" "+snapRef6.getDiffID())))), snapRef6.getBlobChainID())
 	require.Equal(t, string(snapRef6.getChainID()), snapRef6.getSnapshotID())
-	require.Equal(t, !snapRef6.getBlobOnly(), false)
+	require.Equal(t, false, !snapRef6.getBlobOnly())
 
 	_, err = cm.GetByBlob(ctx, ocispecs.Descriptor{
 		Digest: digest.FromBytes([]byte("notexist")),
 		Annotations: map[string]string{
-			"containerd.io/uncompressed": digest.FromBytes([]byte("notexist")).String(),
+			labels.LabelUncompressed: digest.FromBytes([]byte("notexist")).String(),
 		},
 	}, snap3)
 	require.Error(t, err)
 
 	clean(context.TODO())
 
-	//snap.SetBlob()
+	// snap.SetBlob()
 }
 
 func TestPrune(t *testing.T) {
 	t.Parallel()
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, snapshotter.Close())
+	})
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
+	t.Cleanup(cleanup)
 
-	defer cleanup()
 	cm := co.manager
 
 	active, err := cm.New(ctx, nil, nil)
@@ -906,7 +903,7 @@ func TestPrune(t *testing.T) {
 	require.NoError(t, err)
 
 	checkDiskUsage(ctx, t, cm, 2, 0)
-	require.Equal(t, len(buf.all), 0)
+	require.Equal(t, 0, len(buf.all))
 
 	dirs, err = os.ReadDir(filepath.Join(tmpdir, "snapshots/snapshots"))
 	require.NoError(t, err)
@@ -924,7 +921,7 @@ func TestPrune(t *testing.T) {
 	require.NoError(t, err)
 
 	checkDiskUsage(ctx, t, cm, 1, 0)
-	require.Equal(t, len(buf.all), 1)
+	require.Equal(t, 1, len(buf.all))
 
 	dirs, err = os.ReadDir(filepath.Join(tmpdir, "snapshots/snapshots"))
 	require.NoError(t, err)
@@ -951,7 +948,7 @@ func TestPrune(t *testing.T) {
 	require.NoError(t, err)
 
 	checkDiskUsage(ctx, t, cm, 2, 0)
-	require.Equal(t, len(buf.all), 0)
+	require.Equal(t, 0, len(buf.all))
 
 	// releasing last reference
 	err = snap2.Release(ctx)
@@ -964,7 +961,7 @@ func TestPrune(t *testing.T) {
 	require.NoError(t, err)
 
 	checkDiskUsage(ctx, t, cm, 0, 0)
-	require.Equal(t, len(buf.all), 2)
+	require.Equal(t, 2, len(buf.all))
 
 	dirs, err = os.ReadDir(filepath.Join(tmpdir, "snapshots/snapshots"))
 	require.NoError(t, err)
@@ -976,14 +973,15 @@ func TestLazyCommit(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, snapshotter.Close())
+	})
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		tmpdir:          tmpdir,
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
@@ -1073,7 +1071,7 @@ func TestLazyCommit(t *testing.T) {
 	cleanup()
 
 	// we can't close snapshotter and open it twice (especially, its internal bbolt store)
-	co, cleanup, err = newCacheManager(ctx, cmOpt{
+	co, cleanup, err = newCacheManager(ctx, t, cmOpt{
 		tmpdir:          tmpdir,
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
@@ -1102,13 +1100,13 @@ func TestLazyCommit(t *testing.T) {
 
 	cleanup()
 
-	co, cleanup, err = newCacheManager(ctx, cmOpt{
+	co, cleanup, err = newCacheManager(ctx, t, cmOpt{
 		tmpdir:          tmpdir,
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	cm = co.manager
 
 	snap2, err = cm.Get(ctx, snap.ID(), nil)
@@ -1134,19 +1132,17 @@ func TestLoopLeaseContent(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	cm := co.manager
 
 	ctx, done, err := leaseutil.WithLease(ctx, co.lm, leaseutil.MakeTemporary)
@@ -1174,7 +1170,7 @@ func TestLoopLeaseContent(t *testing.T) {
 	allRefs := []ImmutableRef{ref}
 	defer func() {
 		for _, ref := range allRefs {
-			ref.Release(ctx)
+			ref.Release(context.WithoutCancel(ctx))
 		}
 	}()
 	var chain []ocispecs.Descriptor
@@ -1202,7 +1198,7 @@ func TestLoopLeaseContent(t *testing.T) {
 		dgst := cur.Digest
 		visited[dgst] = struct{}{}
 		info, err := co.cs.Info(ctx, dgst)
-		if err != nil && !errors.Is(err, errdefs.ErrNotFound) {
+		if err != nil && !errors.Is(err, cerrdefs.ErrNotFound) {
 			require.NoError(t, err)
 		}
 		var children []ocispecs.Descriptor
@@ -1238,7 +1234,7 @@ func TestLoopLeaseContent(t *testing.T) {
 	// Check if contents are cleaned up
 	for _, d := range gotChain {
 		_, err := co.cs.Info(ctx, d)
-		require.ErrorIs(t, err, errdefs.ErrNotFound)
+		require.ErrorIs(t, err, cerrdefs.ErrNotFound)
 	}
 }
 
@@ -1251,19 +1247,17 @@ func TestSharingCompressionVariant(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 
 	allCompressions := []compression.Type{compression.Uncompressed, compression.Gzip, compression.Zstd, compression.EStargz}
 
@@ -1358,7 +1352,7 @@ func testSharingCompressionVariant(ctx context.Context, t *testing.T, co *cmOut,
 			if err != nil {
 				return nil, "", err
 			}
-			return cw, testCase.a.DefaultMediaType(), nil
+			return cw, testCase.a.MediaType(), nil
 		})
 		require.NoError(t, err)
 		contentBuffer := contentutil.NewBuffer()
@@ -1399,9 +1393,9 @@ func testSharingCompressionVariant(ctx context.Context, t *testing.T, co *cmOut,
 
 		// check if all compression variables are available on the both refs
 		checkCompression := func(desc ocispecs.Descriptor, compressionType compression.Type) {
-			require.Equal(t, compressionType.DefaultMediaType(), desc.MediaType, "compression: %v", compressionType)
+			require.Equal(t, compressionType.MediaType(), desc.MediaType, "compression: %v", compressionType)
 			if compressionType == compression.EStargz {
-				ok, err := isEStargz(ctx, co.cs, desc.Digest)
+				ok, err := compression.EStargz.Is(ctx, co.cs, desc.Digest)
 				require.NoError(t, err, "compression: %v", compressionType)
 				require.True(t, ok, "compression: %v", compressionType)
 			}
@@ -1432,7 +1426,7 @@ func testSharingCompressionVariant(ctx context.Context, t *testing.T, co *cmOut,
 			require.NoError(t, err, "compression: %v", c)
 			uDgst := bDesc.Digest
 			if c != compression.Uncompressed {
-				convertFunc, err := getConverter(ctx, co.cs, bDesc, compression.New(compression.Uncompressed))
+				convertFunc, err := converter.New(ctx, co.cs, bDesc, compression.New(compression.Uncompressed))
 				require.NoError(t, err, "compression: %v", c)
 				uDesc, err := convertFunc(ctx, co.cs, bDesc)
 				require.NoError(t, err, "compression: %v", c)
@@ -1466,7 +1460,7 @@ func ensurePrune(ctx context.Context, t *testing.T, cm Manager, pruneNum, maxRet
 func getCompressor(w io.Writer, compressionType compression.Type, customized bool) (io.WriteCloser, error) {
 	switch compressionType {
 	case compression.Uncompressed:
-		return nil, fmt.Errorf("compression is not requested: %v", compressionType)
+		return nil, errors.Errorf("compression is not requested: %v", compressionType)
 	case compression.Gzip:
 		if customized {
 			gz, _ := gzip.NewWriterLevel(w, gzip.NoCompression)
@@ -1494,7 +1488,7 @@ func getCompressor(w io.Writer, compressionType compression.Type, customized boo
 			}
 			pr.Close()
 		}()
-		return &writeCloser{pw, func() error { <-done; return nil }}, nil
+		return &iohelper.WriteCloser{WriteCloser: pw, CloseFunc: func() error { <-done; return nil }}, nil
 	case compression.Zstd:
 		if customized {
 			skippableFrameMagic := []byte{0x50, 0x2a, 0x4d, 0x18}
@@ -1507,7 +1501,7 @@ func getCompressor(w io.Writer, compressionType compression.Type, customized boo
 		}
 		return zstd.NewWriter(w)
 	default:
-		return nil, fmt.Errorf("unknown compression type: %q", compressionType)
+		return nil, errors.Errorf("unknown compression type: %q", compressionType)
 	}
 }
 
@@ -1519,19 +1513,17 @@ func TestConversion(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	store := co.cs
 
 	// Preapre the original tar blob using archive/tar and tar command on the system
@@ -1546,7 +1538,7 @@ func TestConversion(t *testing.T) {
 	err = cw.Commit(ctx, 0, cw.Digest())
 	require.NoError(t, err)
 
-	orgBlobBytesSys, orgDescSys, err := mapToSystemTarBlob(m)
+	orgBlobBytesSys, orgDescSys, err := mapToSystemTarBlob(t, m)
 	require.NoError(t, err)
 	cw, err = store.Writer(ctx, content.WithRef(fmt.Sprintf("write-test-blob-%s", orgDescSys.Digest)))
 	require.NoError(t, err)
@@ -1569,7 +1561,7 @@ func TestConversion(t *testing.T) {
 					testName := fmt.Sprintf("%s=>%s", i, j)
 
 					// Prepare the source compression type
-					convertFunc, err := getConverter(egctx, store, orgDesc, compSrc)
+					convertFunc, err := converter.New(egctx, store, orgDesc, compSrc)
 					require.NoError(t, err, testName)
 					srcDesc := &orgDesc
 					if convertFunc != nil {
@@ -1578,7 +1570,7 @@ func TestConversion(t *testing.T) {
 					}
 
 					// Convert the blob
-					convertFunc, err = getConverter(egctx, store, *srcDesc, compDest)
+					convertFunc, err = converter.New(egctx, store, *srcDesc, compDest)
 					require.NoError(t, err, testName)
 					resDesc := srcDesc
 					if convertFunc != nil {
@@ -1587,7 +1579,7 @@ func TestConversion(t *testing.T) {
 					}
 
 					// Check the uncompressed digest is the same as the original
-					convertFunc, err = getConverter(egctx, store, *resDesc, compression.New(compression.Uncompressed))
+					convertFunc, err = converter.New(egctx, store, *resDesc, compression.New(compression.Uncompressed))
 					require.NoError(t, err, testName)
 					recreatedDesc := resDesc
 					if convertFunc != nil {
@@ -1596,7 +1588,7 @@ func TestConversion(t *testing.T) {
 					}
 					require.Equal(t, recreatedDesc.Digest, orgDesc.Digest, testName)
 					require.NotNil(t, recreatedDesc.Annotations)
-					require.Equal(t, recreatedDesc.Annotations["containerd.io/uncompressed"], orgDesc.Digest.String(), testName)
+					require.Equal(t, recreatedDesc.Annotations[labels.LabelUncompressed], orgDesc.Digest.String(), testName)
 					return nil
 				})
 			}
@@ -1616,19 +1608,17 @@ func TestGetRemotes(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	cm := co.manager
 
 	ctx, done, err := leaseutil.WithLease(ctx, co.lm, leaseutil.MakeTemporary)
@@ -1784,7 +1774,7 @@ func TestGetRemotes(t *testing.T) {
 					r := refChain[i]
 					isLazy, err := r.isLazy(egctx)
 					require.NoError(t, err)
-					needs, err := needsConversion(ctx, co.cs, desc, compressionType)
+					needs, err := compressionType.NeedsConversion(ctx, co.cs, desc)
 					require.NoError(t, err)
 					if needs {
 						require.False(t, isLazy, "layer %q requires conversion so it must be unlazied", desc.Digest)
@@ -1835,7 +1825,7 @@ func TestGetRemotes(t *testing.T) {
 			eg.Go(func() error {
 				remotes, err := ir.GetRemotes(egctx, false, refCfg, true, nil)
 				require.NoError(t, err)
-				require.True(t, len(remotes) > 0, "for %s : %d", compressionType, len(remotes))
+				require.Greater(t, len(remotes), 0, "for %s : %d", compressionType, len(remotes))
 				gotMain, gotVariants := remotes[0], remotes[1:]
 
 				// Check the main blob is compatible with all == false
@@ -1860,7 +1850,7 @@ func TestGetRemotes(t *testing.T) {
 func checkVariantsCoverage(ctx context.Context, t *testing.T, variants idxToVariants, idx int, remotes []*solver.Remote, expectCompression *compression.Type) {
 	if idx < 0 {
 		for _, r := range remotes {
-			require.Equal(t, len(r.Descriptors), 0)
+			require.Equal(t, 0, len(r.Descriptors))
 		}
 		return
 	}
@@ -1916,19 +1906,17 @@ func TestNondistributableBlobs(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 
 	cm := co.manager
 
@@ -1943,7 +1931,7 @@ func TestNondistributableBlobs(t *testing.T) {
 	require.NoError(t, err)
 
 	// Pretend like this is non-distributable
-	desc.MediaType = ocispecs.MediaTypeImageLayerNonDistributable
+	desc.MediaType = ocispecs.MediaTypeImageLayerNonDistributable //nolint:staticcheck // ignore SA1019: Non-distributable layers are deprecated, and not recommended for future use.
 	desc.URLs = []string{"https://buildkit.moby.dev/foo"}
 
 	cw, err := contentBuffer.Writer(ctx)
@@ -1981,7 +1969,7 @@ func checkInfo(ctx context.Context, t *testing.T, cs content.Store, info content
 	if info.Labels == nil {
 		return
 	}
-	uncompressedDgst, ok := info.Labels[containerdUncompressed]
+	uncompressedDgst, ok := info.Labels[labels.LabelUncompressed]
 	if !ok {
 		return
 	}
@@ -2003,7 +1991,7 @@ func checkDescriptor(ctx context.Context, t *testing.T, cs content.Store, desc o
 	}
 
 	// Check annotations exist
-	uncompressedDgst, ok := desc.Annotations[containerdUncompressed]
+	uncompressedDgst, ok := desc.Annotations[labels.LabelUncompressed]
 	require.True(t, ok, "uncompressed digest annotation not found: %q", desc.Digest)
 	var uncompressedSize int64
 	if compressionType == compression.EStargz {
@@ -2017,9 +2005,9 @@ func checkDescriptor(ctx context.Context, t *testing.T, cs content.Store, desc o
 	}
 
 	// Check annotation values are valid
-	c := new(counter)
+	c := new(iohelper.Counter)
 	ra, err := cs.ReaderAt(ctx, desc)
-	if err != nil && errdefs.IsNotFound(err) {
+	if err != nil && cerrdefs.IsNotFound(err) {
 		return // lazy layer
 	}
 	require.NoError(t, err)
@@ -2032,13 +2020,13 @@ func checkDescriptor(ctx context.Context, t *testing.T, cs content.Store, desc o
 	require.NoError(t, err)
 	require.Equal(t, diffID.Digest().String(), uncompressedDgst)
 	if compressionType == compression.EStargz {
-		require.Equal(t, c.size(), uncompressedSize)
+		require.Equal(t, c.Size(), uncompressedSize)
 	}
 }
 
 func TestMergeOp(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Depends on unimplemented merge-op support on Windows")
+	if runtime.GOOS == "windows" || runtime.GOOS == "freebsd" {
+		t.Skipf("Depends on unimplemented merge-op support on %s", runtime.GOOS)
 	}
 
 	// This just tests the basic Merge method and some of the logic with releasing merge refs.
@@ -2047,19 +2035,17 @@ func TestMergeOp(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	cm := co.manager
 
 	emptyMerge, err := cm.Merge(ctx, nil, nil)
@@ -2091,12 +2077,13 @@ func TestMergeOp(t *testing.T) {
 
 	singleMerge, err := cm.Merge(ctx, baseRefs[:1], nil)
 	require.NoError(t, err)
+	require.True(t, singleMerge.(*immutableRef).getCommitted())
 	m, err := singleMerge.Mount(ctx, true, nil)
 	require.NoError(t, err)
 	ms, unmount, err := m.Mount()
 	require.NoError(t, err)
 	require.Len(t, ms, 1)
-	require.Equal(t, ms[0].Type, "bind")
+	require.Equal(t, "bind", ms[0].Type)
 	err = fstest.CheckDirectoryEqualWithApplier(ms[0].Source, fstest.Apply(
 		fstest.CreateFile(strconv.Itoa(0), []byte(strconv.Itoa(0)), 0777),
 	))
@@ -2111,6 +2098,7 @@ func TestMergeOp(t *testing.T) {
 
 	merge1, err := cm.Merge(ctx, baseRefs[:3], nil)
 	require.NoError(t, err)
+	require.True(t, merge1.(*immutableRef).getCommitted())
 	_, err = merge1.Mount(ctx, true, nil)
 	require.NoError(t, err)
 	size1, err := merge1.(*immutableRef).size(ctx)
@@ -2120,6 +2108,7 @@ func TestMergeOp(t *testing.T) {
 
 	merge2, err := cm.Merge(ctx, baseRefs[3:], nil)
 	require.NoError(t, err)
+	require.True(t, merge2.(*immutableRef).getCommitted())
 	_, err = merge2.Mount(ctx, true, nil)
 	require.NoError(t, err)
 	size2, err := merge2.(*immutableRef).size(ctx)
@@ -2135,6 +2124,7 @@ func TestMergeOp(t *testing.T) {
 
 	merge3, err := cm.Merge(ctx, []ImmutableRef{merge1, merge2}, nil)
 	require.NoError(t, err)
+	require.True(t, merge3.(*immutableRef).getCommitted())
 	require.NoError(t, merge1.Release(ctx))
 	require.NoError(t, merge2.Release(ctx))
 	_, err = merge3.Mount(ctx, true, nil)
@@ -2153,8 +2143,8 @@ func TestMergeOp(t *testing.T) {
 }
 
 func TestDiffOp(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Depends on unimplemented diff-op support on Windows")
+	if runtime.GOOS == "windows" || runtime.GOOS == "freebsd" {
+		t.Skipf("Depends on unimplemented diff-op support on %s", runtime.GOOS)
 	}
 
 	// This just tests the basic Diff method and some of the logic with releasing diff refs.
@@ -2163,19 +2153,17 @@ func TestDiffOp(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	cm := co.manager
 
 	newLower, err := cm.New(ctx, nil, nil)
@@ -2267,20 +2255,21 @@ func TestLoadHalfFinalizedRef(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, snapshotter.Close())
+	})
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		tmpdir:          tmpdir,
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	cm := co.manager.(*cacheManager)
 
 	mref, err := cm.New(ctx, nil, nil, CachePolicyRetain)
@@ -2316,15 +2305,15 @@ func TestLoadHalfFinalizedRef(t *testing.T) {
 	require.NoError(t, iref.Release(ctx))
 
 	require.NoError(t, cm.Close())
-	require.NoError(t, cleanup())
+	cleanup()
 
-	co, cleanup, err = newCacheManager(ctx, cmOpt{
+	co, cleanup, err = newCacheManager(ctx, t, cmOpt{
 		tmpdir:          tmpdir,
 		snapshotter:     snapshotter,
 		snapshotterName: "native",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	cm = co.manager.(*cacheManager)
 
 	_, err = cm.GetMutable(ctx, mutRef.ID())
@@ -2347,19 +2336,17 @@ func TestMountReadOnly(t *testing.T) {
 
 	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
 
-	tmpdir, err := os.MkdirTemp("", "cachemanager")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
 
-	co, cleanup, err := newCacheManager(ctx, cmOpt{
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
 		snapshotter:     snapshotter,
 		snapshotterName: "overlay",
 	})
 	require.NoError(t, err)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	cm := co.manager
 
 	mutRef, err := cm.New(ctx, nil, nil)
@@ -2405,6 +2392,193 @@ func TestMountReadOnly(t *testing.T) {
 		// repeat with a ref that has a parent
 		mutRef, err = cm.New(ctx, immutRef, nil)
 		require.NoError(t, err)
+	}
+}
+
+func TestLoadBrokenParents(t *testing.T) {
+	// Test that a ref that has a parent that can't be loaded will not result in any leaks
+	// of other parent refs
+	t.Parallel()
+
+	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+
+	tmpdir := t.TempDir()
+
+	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, snapshotter.Close())
+	})
+
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
+		tmpdir:          tmpdir,
+		snapshotter:     snapshotter,
+		snapshotterName: "native",
+	})
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	cm := co.manager.(*cacheManager)
+
+	mutRef, err := cm.New(ctx, nil, nil)
+	require.NoError(t, err)
+	refA, err := mutRef.Commit(ctx)
+	require.NoError(t, err)
+	refAID := refA.ID()
+	mutRef, err = cm.New(ctx, nil, nil)
+	require.NoError(t, err)
+	refB, err := mutRef.Commit(ctx)
+	require.NoError(t, err)
+
+	_, err = cm.Merge(ctx, []ImmutableRef{refA, refB}, nil)
+	require.NoError(t, err)
+	checkDiskUsage(ctx, t, cm, 3, 0)
+
+	// set refB as deleted
+	require.NoError(t, refB.(*immutableRef).queueDeleted())
+	require.NoError(t, refB.(*immutableRef).commitMetadata())
+	require.NoError(t, cm.Close())
+	cleanup()
+
+	co, cleanup, err = newCacheManager(ctx, t, cmOpt{
+		tmpdir:          tmpdir,
+		snapshotter:     snapshotter,
+		snapshotterName: "native",
+	})
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	cm = co.manager.(*cacheManager)
+
+	checkDiskUsage(ctx, t, cm, 0, 1)
+	refA, err = cm.Get(ctx, refAID, nil)
+	require.NoError(t, err)
+	require.Len(t, refA.(*immutableRef).refs, 1)
+}
+
+func TestCalculateKeepBytes(t *testing.T) {
+	ts := []struct {
+		name      string
+		totalSize int64
+		stat      disk.DiskStat
+		opt       client.PruneInfo
+		result    int64
+	}{
+		{
+			name:      "empty",
+			totalSize: 1000,
+			stat: disk.DiskStat{
+				Total: 10000,
+				Free:  9000,
+			},
+			opt:    client.PruneInfo{},
+			result: 0,
+		},
+		{
+			name:      "only buildkit max",
+			totalSize: 1000,
+			stat: disk.DiskStat{
+				Total: 10000,
+				Free:  9000,
+			},
+			opt: client.PruneInfo{
+				MaxUsedSpace: 2000, // 20% of the disk
+			},
+			result: 2000,
+		},
+		{
+			name:      "only buildkit free",
+			totalSize: 7000,
+			stat: disk.DiskStat{
+				Total: 10000,
+				Free:  3000,
+			},
+			opt: client.PruneInfo{
+				MinFreeSpace: 5000, // 50% of the disk
+			},
+			result: 5000,
+		},
+		{
+			name:      "only buildkit free with min",
+			totalSize: 7000,
+			stat: disk.DiskStat{
+				Total: 10000,
+				Free:  3000,
+			},
+			opt: client.PruneInfo{
+				MinFreeSpace:  5000, // 50% of the disk
+				ReservedSpace: 6000, // 60% of the disk,
+			},
+			result: 6000,
+		},
+		{
+			name:      "only buildkit free all",
+			totalSize: 7000,
+			stat: disk.DiskStat{
+				Total: 10000,
+				Free:  3000,
+			},
+			opt: client.PruneInfo{
+				MinFreeSpace:  5000, // 50% of the disk
+				ReservedSpace: 2000, // 20% of the disk
+				MaxUsedSpace:  4000, // 40% of the disk
+			},
+			result: 4000,
+		},
+		{
+			name:      "mixed max",
+			totalSize: 4000,
+			stat: disk.DiskStat{
+				Total: 10000,
+				Free:  2000, // something else is using 4000
+			},
+			opt: client.PruneInfo{
+				MaxUsedSpace: 2000, // 20% of the disk
+			},
+			result: 2000,
+		},
+		{
+			name:      "mixed free",
+			totalSize: 4000,
+			stat: disk.DiskStat{
+				Total: 10000,
+				Free:  2000, // something else is using 4000
+			},
+			opt: client.PruneInfo{
+				MinFreeSpace: 5000, // 50% of the disk
+			},
+			result: 1000,
+		},
+		{
+			name:      "mixed free with min",
+			totalSize: 4000,
+			stat: disk.DiskStat{
+				Total: 10000,
+				Free:  2000, // something else is using 4000
+			},
+			opt: client.PruneInfo{
+				MinFreeSpace:  5000, // 50% of the disk
+				ReservedSpace: 2000, // 20% of the disk
+			},
+			result: 2000,
+		},
+		{
+			name:      "mixed free all",
+			totalSize: 4000,
+			stat: disk.DiskStat{
+				Total: 10000,
+				Free:  2000, // something else is using 4000
+			},
+			opt: client.PruneInfo{
+				MinFreeSpace:  5000, // 50% of the disk
+				ReservedSpace: 2000, // 20% of the disk
+				MaxUsedSpace:  4000, // 40% of the disk
+			},
+			result: 2000,
+		},
+	}
+	for _, tc := range ts {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.result, calculateKeepBytes(tc.totalSize, tc.stat, tc.opt))
+		})
 	}
 }
 
@@ -2537,7 +2711,7 @@ func mapToBlobWithCompression(m map[string]string, compress func(io.Writer) (io.
 		MediaType: mediaType,
 		Size:      int64(buf.Len()),
 		Annotations: map[string]string{
-			"containerd.io/uncompressed": sha.Digest().String(),
+			labels.LabelUncompressed: sha.Digest().String(),
 		},
 	}, nil
 }
@@ -2557,7 +2731,7 @@ func fileToBlob(file *os.File, compress bool) ([]byte, ocispecs.Descriptor, erro
 		return nil, ocispecs.Descriptor{}, err
 	}
 
-	fi, err := tar.FileInfoHeader(info, "")
+	fi, err := tarheader.FileInfoHeaderNoLookups(info, "")
 	if err != nil {
 		return nil, ocispecs.Descriptor{}, err
 	}
@@ -2589,17 +2763,13 @@ func fileToBlob(file *os.File, compress bool) ([]byte, ocispecs.Descriptor, erro
 		MediaType: mediaType,
 		Size:      int64(buf.Len()),
 		Annotations: map[string]string{
-			"containerd.io/uncompressed": sha.Digest().String(),
+			labels.LabelUncompressed: sha.Digest().String(),
 		},
 	}, nil
 }
 
-func mapToSystemTarBlob(m map[string]string) ([]byte, ocispecs.Descriptor, error) {
-	tmpdir, err := os.MkdirTemp("", "tarcreation")
-	if err != nil {
-		return nil, ocispecs.Descriptor{}, err
-	}
-	defer os.RemoveAll(tmpdir)
+func mapToSystemTarBlob(t *testing.T, m map[string]string) ([]byte, ocispecs.Descriptor, error) {
+	tmpdir := t.TempDir()
 
 	expected := map[string]string{}
 	for k, v := range m {
@@ -2650,7 +2820,7 @@ func mapToSystemTarBlob(m map[string]string) ([]byte, ocispecs.Descriptor, error
 		MediaType: ocispecs.MediaTypeImageLayer,
 		Size:      int64(len(tarout)),
 		Annotations: map[string]string{
-			"containerd.io/uncompressed": digest.FromBytes(tarout).String(),
+			labels.LabelUncompressed: digest.FromBytes(tarout).String(),
 		},
 	}, nil
 }
@@ -2664,7 +2834,7 @@ func isReadOnly(mnt mount.Mount) bool {
 			hasUpperdir = true
 		}
 	}
-	if mnt.Type == "overlay" {
+	if overlay.IsOverlayMountType(mnt) {
 		return !hasUpperdir
 	}
 	return false

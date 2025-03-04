@@ -47,7 +47,7 @@ func TestMkdirMkfile(t *testing.T) {
 	inp := rb.NewRef("ref1")
 	outs, err := s.Solve(context.TODO(), []fileoptypes.Ref{inp}, fo.Actions, nil)
 	require.NoError(t, err)
-	require.Equal(t, len(outs), 1)
+	require.Equal(t, 1, len(outs))
 	rb.checkReleased(t, append(outs, inp))
 
 	o := outs[0].(*testFileRef)
@@ -117,7 +117,7 @@ func TestChownOpt(t *testing.T) {
 	inp2 := rb.NewRef("usermount")
 	outs, err := s.Solve(context.TODO(), []fileoptypes.Ref{inp, inp2}, fo.Actions, nil)
 	require.NoError(t, err)
-	require.Equal(t, len(outs), 1)
+	require.Equal(t, 1, len(outs))
 	rb.checkReleased(t, append(outs, inp, inp2))
 
 	o := outs[0].(*testFileRef)
@@ -179,7 +179,7 @@ func TestChownCopy(t *testing.T) {
 	inpDest := rb.NewRef("dest")
 	outs, err := s.Solve(context.TODO(), []fileoptypes.Ref{inpSrc, inpDest}, fo.Actions, nil)
 	require.NoError(t, err)
-	require.Equal(t, len(outs), 1)
+	require.Equal(t, 1, len(outs))
 	rb.checkReleased(t, append(outs, inpSrc, inpDest))
 
 	o := outs[0].(*testFileRef)
@@ -348,7 +348,7 @@ func TestMultiOutput(t *testing.T) {
 	inp := rb.NewRef("ref1")
 	outs, err := s.Solve(context.TODO(), []fileoptypes.Ref{inp}, fo.Actions, nil)
 	require.NoError(t, err)
-	require.Equal(t, len(outs), 2)
+	require.Equal(t, 2, len(outs))
 	rb.checkReleased(t, append(outs, inp))
 
 	o := outs[0].(*testFileRef)
@@ -396,7 +396,7 @@ func TestFileFromScratch(t *testing.T) {
 	s, rb := newTestFileSolver()
 	outs, err := s.Solve(context.TODO(), []fileoptypes.Ref{}, fo.Actions, nil)
 	require.NoError(t, err)
-	require.Equal(t, len(outs), 1)
+	require.Equal(t, 1, len(outs))
 	rb.checkReleased(t, outs)
 
 	o := outs[0].(*testFileRef)
@@ -430,7 +430,7 @@ func TestFileCopyInputSrc(t *testing.T) {
 	inp1 := rb.NewRef("destref")
 	outs, err := s.Solve(context.TODO(), []fileoptypes.Ref{inp0, inp1}, fo.Actions, nil)
 	require.NoError(t, err)
-	require.Equal(t, len(outs), 1)
+	require.Equal(t, 1, len(outs))
 	rb.checkReleased(t, append(outs, inp0, inp1))
 
 	o := outs[0].(*testFileRef)
@@ -484,7 +484,7 @@ func TestFileCopyInputRm(t *testing.T) {
 	inp1 := rb.NewRef("destref")
 	outs, err := s.Solve(context.TODO(), []fileoptypes.Ref{inp0, inp1}, fo.Actions, nil)
 	require.NoError(t, err)
-	require.Equal(t, len(outs), 1)
+	require.Equal(t, 1, len(outs))
 	rb.checkReleased(t, append(outs, inp0, inp1))
 
 	o := outs[0].(*testFileRef)
@@ -548,7 +548,7 @@ func TestFileParallelActions(t *testing.T) {
 
 	outs, err := s.Solve(context.TODO(), []fileoptypes.Ref{inp}, fo.Actions, nil)
 	require.NoError(t, err)
-	require.Equal(t, len(outs), 1)
+	require.Equal(t, 1, len(outs))
 
 	require.Equal(t, int64(2), sem)
 }
@@ -600,6 +600,7 @@ type mod struct {
 	rm      *pb.FileActionRm
 	mkfile  *pb.FileActionMkFile
 	copy    *pb.FileActionCopy
+	symlink *pb.FileActionSymlink
 	copySrc []mod
 }
 
@@ -622,39 +623,47 @@ func (tm *testMount) Readonly() bool {
 	return tm.readonly
 }
 
-type testFileBackend struct {
-}
+type testFileBackend struct{}
 
-func (b *testFileBackend) Mkdir(_ context.Context, m, user, group fileoptypes.Mount, a pb.FileActionMkDir) error {
+func (b *testFileBackend) Mkdir(_ context.Context, m, user, group fileoptypes.Mount, a *pb.FileActionMkDir) error {
 	mm := m.(*testMount)
 	if mm.callback != nil {
 		mm.callback()
 	}
 	mm.id += "-mkdir"
 	mm.addUser(user, group)
-	mm.chain = append(mm.chain, mod{mkdir: &a})
+	mm.chain = append(mm.chain, mod{mkdir: a})
 	return nil
 }
 
-func (b *testFileBackend) Mkfile(_ context.Context, m, user, group fileoptypes.Mount, a pb.FileActionMkFile) error {
+func (b *testFileBackend) Mkfile(_ context.Context, m, user, group fileoptypes.Mount, a *pb.FileActionMkFile) error {
 	mm := m.(*testMount)
 	mm.id += "-mkfile"
 	mm.addUser(user, group)
-	mm.chain = append(mm.chain, mod{mkfile: &a})
+	mm.chain = append(mm.chain, mod{mkfile: a})
 	return nil
 }
-func (b *testFileBackend) Rm(_ context.Context, m fileoptypes.Mount, a pb.FileActionRm) error {
+
+func (b *testFileBackend) Symlink(_ context.Context, m, user, group fileoptypes.Mount, a *pb.FileActionSymlink) error {
+	mm := m.(*testMount)
+	mm.id += "-symlink"
+	mm.chain = append(mm.chain, mod{symlink: a})
+	return nil
+}
+
+func (b *testFileBackend) Rm(_ context.Context, m fileoptypes.Mount, a *pb.FileActionRm) error {
 	mm := m.(*testMount)
 	mm.id += "-rm"
-	mm.chain = append(mm.chain, mod{rm: &a})
+	mm.chain = append(mm.chain, mod{rm: a})
 	return nil
 }
-func (b *testFileBackend) Copy(_ context.Context, m1, m, user, group fileoptypes.Mount, a pb.FileActionCopy) error {
+
+func (b *testFileBackend) Copy(_ context.Context, m1, m, user, group fileoptypes.Mount, a *pb.FileActionCopy) error {
 	mm := m.(*testMount)
 	mm1 := m1.(*testMount)
 	mm.id += "-copy(" + mm1.id + ")"
 	mm.addUser(user, group)
-	mm.chain = append(mm.chain, mod{copy: &a, copySrc: mm1.chain})
+	mm.chain = append(mm.chain, mod{copy: a, copySrc: mm1.chain})
 	return nil
 }
 
@@ -690,6 +699,7 @@ func (b *testFileRefBackend) Prepare(ctx context.Context, ref fileoptypes.Ref, r
 	m2.chain = append([]mod{}, m2.chain...)
 	return &m2, nil
 }
+
 func (b *testFileRefBackend) Commit(ctx context.Context, mount fileoptypes.Mount) (fileoptypes.Ref, error) {
 	m := mount.(*testMount)
 	if err := b.mounts[m.initID].Release(context.TODO()); err != nil {

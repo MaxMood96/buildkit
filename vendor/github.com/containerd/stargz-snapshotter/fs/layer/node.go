@@ -36,7 +36,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/containerd/containerd/log"
+	"github.com/containerd/log"
 	"github.com/containerd/stargz-snapshotter/estargz"
 	commonmetrics "github.com/containerd/stargz-snapshotter/fs/metrics/common"
 	"github.com/containerd/stargz-snapshotter/fs/reader"
@@ -45,18 +45,21 @@ import (
 	fusefs "github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	digest "github.com/opencontainers/go-digest"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
 const (
 	blockSize         = 4096
-	whiteoutPrefix    = ".wh."
-	whiteoutOpaqueDir = whiteoutPrefix + whiteoutPrefix + ".opq"
-	opaqueXattrValue  = "y"
-	stateDirName      = ".stargz-snapshotter"
-	statFileMode      = syscall.S_IFREG | 0400 // -r--------
-	stateDirMode      = syscall.S_IFDIR | 0500 // dr-x------
+	physicalBlockSize = 512
+	// physicalBlockRatio is the ratio of blockSize to physicalBlockSize.
+	// It can be used to convert from # blockSize-byte blocks to # physicalBlockSize-byte blocks
+	physicalBlockRatio = blockSize / physicalBlockSize
+	whiteoutPrefix     = ".wh."
+	whiteoutOpaqueDir  = whiteoutPrefix + whiteoutPrefix + ".opq"
+	opaqueXattrValue   = "y"
+	stateDirName       = ".stargz-snapshotter"
+	statFileMode       = syscall.S_IFREG | 0400 // -r--------
+	stateDirMode       = syscall.S_IFDIR | 0500 // dr-x------
 )
 
 type OverlayOpaqueType int
@@ -127,11 +130,13 @@ func (fs *fs) inodeOfID(id uint32) (uint64, error) {
 // node is a filesystem inode abstraction.
 type node struct {
 	fusefs.Inode
-	fs         *fs
-	id         uint32
-	attr       metadata.Attr
+	fs   *fs
+	id   uint32
+	attr metadata.Attr
+
 	ents       []fuse.DirEntry
 	entsCached bool
+	entsMu     sync.Mutex
 }
 
 func (n *node) isRootNode() bool {
@@ -162,9 +167,13 @@ func (n *node) readdir() ([]fuse.DirEntry, syscall.Errno) {
 	start := time.Now() // set start time
 	defer commonmetrics.MeasureLatencyInMicroseconds(commonmetrics.NodeReaddir, n.fs.layerDigest, start)
 
+	n.entsMu.Lock()
 	if n.entsCached {
-		return n.ents, 0
+		ents := n.ents
+		n.entsMu.Unlock()
+		return ents, 0
 	}
+	n.entsMu.Unlock()
 
 	isRoot := n.isRootNode()
 
@@ -228,6 +237,8 @@ func (n *node) readdir() ([]fuse.DirEntry, syscall.Errno) {
 	sort.Slice(ents, func(i, j int) bool {
 		return ents[i].Name < ents[j].Name
 	})
+	n.entsMu.Lock()
+	defer n.entsMu.Unlock()
 	n.ents, n.entsCached = ents, true // cache it
 
 	return ents, 0
@@ -279,6 +290,7 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fu
 	}
 
 	// early return if this entry doesn't exist
+	n.entsMu.Lock()
 	if n.entsCached {
 		var found bool
 		for _, e := range n.ents {
@@ -287,9 +299,11 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fu
 			}
 		}
 		if !found {
+			n.entsMu.Unlock()
 			return nil, syscall.ENOENT
 		}
 	}
+	n.entsMu.Unlock()
 
 	id, ce, err := n.fs.r.Metadata().GetChild(n.id, name)
 	if err != nil {
@@ -597,7 +611,7 @@ func (sf *statFile) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Err
 // The entries naming is kept to be consistend with the field naming in statJSON.
 func (sf *statFile) logContents() {
 	ctx := context.Background()
-	log.G(ctx).WithFields(logrus.Fields{
+	log.G(ctx).WithFields(log.Fields{
 		"digest": sf.statJSON.Digest, "size": sf.statJSON.Size,
 		"fetchedSize": sf.statJSON.FetchedSize, "fetchedPercent": sf.statJSON.FetchedPercent,
 	}).WithError(errors.New(sf.statJSON.Error)).Error("statFile error")
@@ -641,10 +655,7 @@ func entryToAttr(ino uint64, e metadata.Attr, out *fuse.Attr) fusefs.StableAttr 
 		out.Size = uint64(len(e.LinkName))
 	}
 	out.Blksize = blockSize
-	out.Blocks = out.Size / uint64(out.Blksize)
-	if out.Size%uint64(out.Blksize) > 0 {
-		out.Blocks++
-	}
+	out.Blocks = (out.Size + uint64(out.Blksize) - 1) / uint64(out.Blksize) * physicalBlockRatio
 	mtime := e.ModTime
 	out.SetTimes(nil, &mtime, nil)
 	out.Mode = fileModeToSystemMode(e.Mode)
@@ -721,7 +732,7 @@ func (fs *fs) statFileToAttr(size uint64, out *fuse.Attr) fusefs.StableAttr {
 	out.Ino = fs.inodeOfStatFile()
 	out.Size = size
 	out.Blksize = blockSize
-	out.Blocks = out.Size / uint64(out.Blksize)
+	out.Blocks = (out.Size + uint64(out.Blksize) - 1) / uint64(out.Blksize) * physicalBlockRatio
 	out.Nlink = 1
 
 	// Root can read it ("-r-------- root root").

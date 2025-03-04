@@ -24,25 +24,24 @@ package remote
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"math/rand"
+	"math/big"
 	"mime"
 	"mime/multipart"
 	"net/http"
-	"net/url"
 	"path"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/reference"
-	"github.com/containerd/containerd/remotes/docker"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/pkg/reference"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
 	"github.com/containerd/stargz-snapshotter/cache"
 	"github.com/containerd/stargz-snapshotter/fs/config"
 	commonmetrics "github.com/containerd/stargz-snapshotter/fs/metrics/common"
@@ -167,7 +166,11 @@ func jitter(duration time.Duration) time.Duration {
 	if duration <= 0 {
 		return duration
 	}
-	return time.Duration(rand.Int63n(int64(duration)) + int64(duration))
+	b, err := rand.Int(rand.Reader, big.NewInt(int64(duration)))
+	if err != nil {
+		panic(err)
+	}
+	return time.Duration(b.Int64() + int64(duration))
 }
 
 // backoffStrategy extends retryablehttp's DefaultBackoff to add a random jitter to avoid overwhelming the repository
@@ -200,7 +203,7 @@ func newHTTPFetcher(ctx context.Context, fc *fetcherConfig) (*httpFetcher, int64
 		return nil, 0, fmt.Errorf("Digest is mandatory in layer descriptor")
 	}
 	digest := desc.Digest
-	pullScope, err := repositoryScope(fc.refspec, false)
+	pullScope, err := docker.RepositoryScope(fc.refspec, false)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -217,15 +220,16 @@ func newHTTPFetcher(ctx context.Context, fc *fetcherConfig) (*httpFetcher, int64
 		// Prepare transport with authorization functionality
 		tr := host.Client.Transport
 
+		timeout := host.Client.Timeout
 		if rt, ok := tr.(*rhttp.RoundTripper); ok {
 			rt.Client.RetryMax = fc.maxRetries
 			rt.Client.RetryWaitMin = fc.minWaitMSec
 			rt.Client.RetryWaitMax = fc.maxWaitMSec
 			rt.Client.Backoff = backoffStrategy
 			rt.Client.CheckRetry = retryStrategy
+			timeout = rt.Client.HTTPClient.Timeout
 		}
 
-		timeout := host.Client.Timeout
 		if host.Authorizer != nil {
 			tr = &transport{
 				inner: tr,
@@ -240,7 +244,7 @@ func newHTTPFetcher(ctx context.Context, fc *fetcherConfig) (*httpFetcher, int64
 			path.Join(host.Host, host.Path),
 			strings.TrimPrefix(fc.refspec.Locator, fc.refspec.Hostname()+"/"),
 			digest)
-		url, err := redirect(ctx, blobURL, tr, timeout)
+		url, header, err := redirect(ctx, blobURL, tr, timeout, host.Header)
 		if err != nil {
 			rErr = fmt.Errorf("failed to redirect (host %q, ref:%q, digest:%q): %v: %w", host.Host, fc.refspec, digest, err, rErr)
 			continue // Try another
@@ -249,7 +253,7 @@ func newHTTPFetcher(ctx context.Context, fc *fetcherConfig) (*httpFetcher, int64
 		// Get size information
 		// TODO: we should try to use the Size field in the descriptor here.
 		start := time.Now() // start time before getting layer header
-		size, err := getSize(ctx, url, tr, timeout)
+		size, err := getSize(ctx, url, tr, timeout, header)
 		commonmetrics.MeasureLatencyInMilliseconds(commonmetrics.StargzHeaderGet, digest, start) // time to get layer header
 		if err != nil {
 			rErr = fmt.Errorf("failed to get size (host %q, ref:%q, digest:%q): %v: %w", host.Host, fc.refspec, digest, err, rErr)
@@ -258,11 +262,13 @@ func newHTTPFetcher(ctx context.Context, fc *fetcherConfig) (*httpFetcher, int64
 
 		// Hit one destination
 		return &httpFetcher{
-			url:     url,
-			tr:      tr,
-			blobURL: blobURL,
-			digest:  digest,
-			timeout: timeout,
+			url:       url,
+			tr:        tr,
+			blobURL:   blobURL,
+			digest:    digest,
+			timeout:   timeout,
+			header:    header,
+			orgHeader: host.Header,
 		}, size, nil
 	}
 
@@ -311,7 +317,7 @@ func (tr *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-func redirect(ctx context.Context, blobURL string, tr http.RoundTripper, timeout time.Duration) (url string, err error) {
+func redirect(ctx context.Context, blobURL string, tr http.RoundTripper, timeout time.Duration, header http.Header) (url string, withHeader http.Header, err error) {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -322,32 +328,38 @@ func redirect(ctx context.Context, blobURL string, tr http.RoundTripper, timeout
 	// ghcr.io returns 200 on HEAD without Location header (2020).
 	req, err := http.NewRequestWithContext(ctx, "GET", blobURL, nil)
 	if err != nil {
-		return "", fmt.Errorf("failed to make request to the registry: %w", err)
+		return "", nil, fmt.Errorf("failed to make request to the registry: %w", err)
+	}
+	req.Header = http.Header{}
+	for k, v := range header {
+		req.Header[k] = v
 	}
 	req.Close = false
 	req.Header.Set("Range", "bytes=0-1")
 	res, err := tr.RoundTrip(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to request: %w", err)
+		return "", nil, fmt.Errorf("failed to request: %w", err)
 	}
 	defer func() {
-		io.Copy(ioutil.Discard, res.Body)
+		io.Copy(io.Discard, res.Body)
 		res.Body.Close()
 	}()
 
 	if res.StatusCode/100 == 2 {
 		url = blobURL
+		withHeader = header
 	} else if redir := res.Header.Get("Location"); redir != "" && res.StatusCode/100 == 3 {
 		// TODO: Support nested redirection
 		url = redir
+		// Do not pass headers to the redirected location.
 	} else {
-		return "", fmt.Errorf("failed to access to the registry with code %v", res.StatusCode)
+		return "", nil, fmt.Errorf("failed to access to the registry with code %v", res.StatusCode)
 	}
 
 	return
 }
 
-func getSize(ctx context.Context, url string, tr http.RoundTripper, timeout time.Duration) (int64, error) {
+func getSize(ctx context.Context, url string, tr http.RoundTripper, timeout time.Duration, header http.Header) (int64, error) {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -356,6 +368,10 @@ func getSize(ctx context.Context, url string, tr http.RoundTripper, timeout time
 	req, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
 	if err != nil {
 		return 0, err
+	}
+	req.Header = http.Header{}
+	for k, v := range header {
+		req.Header[k] = v
 	}
 	req.Close = false
 	res, err := tr.RoundTrip(req)
@@ -375,6 +391,10 @@ func getSize(ctx context.Context, url string, tr http.RoundTripper, timeout time
 	if err != nil {
 		return 0, fmt.Errorf("failed to make request to the registry: %w", err)
 	}
+	req.Header = http.Header{}
+	for k, v := range header {
+		req.Header[k] = v
+	}
 	req.Close = false
 	req.Header.Set("Range", "bytes=0-1")
 	res, err = tr.RoundTrip(req)
@@ -382,7 +402,7 @@ func getSize(ctx context.Context, url string, tr http.RoundTripper, timeout time
 		return 0, fmt.Errorf("failed to request: %w", err)
 	}
 	defer func() {
-		io.Copy(ioutil.Discard, res.Body)
+		io.Copy(io.Discard, res.Body)
 		res.Body.Close()
 	}()
 
@@ -406,6 +426,8 @@ type httpFetcher struct {
 	singleRange   bool
 	singleRangeMu sync.Mutex
 	timeout       time.Duration
+	header        http.Header
+	orgHeader     http.Header
 }
 
 type multipartReadCloser interface {
@@ -444,6 +466,10 @@ func (f *httpFetcher) fetch(ctx context.Context, rs []region, retry bool) (multi
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
+	}
+	req.Header = http.Header{}
+	for k, v := range f.header {
+		req.Header[k] = v
 	}
 	var ranges string
 	for _, reg := range requests {
@@ -516,6 +542,10 @@ func (f *httpFetcher) check() error {
 	if err != nil {
 		return fmt.Errorf("check failed: failed to make request: %w", err)
 	}
+	req.Header = http.Header{}
+	for k, v := range f.header {
+		req.Header[k] = v
+	}
 	req.Close = false
 	req.Header.Set("Range", "bytes=0-1")
 	res, err := f.tr.RoundTrip(req)
@@ -523,7 +553,7 @@ func (f *httpFetcher) check() error {
 		return fmt.Errorf("check failed: failed to request to registry: %w", err)
 	}
 	defer func() {
-		io.Copy(ioutil.Discard, res.Body)
+		io.Copy(io.Discard, res.Body)
 		res.Body.Close()
 	}()
 	if res.StatusCode == http.StatusOK || res.StatusCode == http.StatusPartialContent {
@@ -546,12 +576,13 @@ func (f *httpFetcher) check() error {
 }
 
 func (f *httpFetcher) refreshURL(ctx context.Context) error {
-	newURL, err := redirect(ctx, f.blobURL, f.tr, f.timeout)
+	newURL, headers, err := redirect(ctx, f.blobURL, f.tr, f.timeout, f.orgHeader)
 	if err != nil {
 		return err
 	}
 	f.urlMu.Lock()
 	f.url = newURL
+	f.header = headers
 	f.urlMu.Unlock()
 	return nil
 }
@@ -659,24 +690,6 @@ func WithCacheOpts(cacheOpts ...cache.Option) Option {
 	return func(opts *options) {
 		opts.cacheOpts = cacheOpts
 	}
-}
-
-// NOTE: ported from https://github.com/containerd/containerd/blob/v1.5.2/remotes/docker/scope.go#L29-L42
-// TODO: import this from containerd package once we drop support to continerd v1.4.x
-//
-// repositoryScope returns a repository scope string such as "repository:foo/bar:pull"
-// for "host/foo/bar:baz".
-// When push is true, both pull and push are added to the scope.
-func repositoryScope(refspec reference.Spec, push bool) (string, error) {
-	u, err := url.Parse("dummy://" + refspec.Locator)
-	if err != nil {
-		return "", err
-	}
-	s := "repository:" + strings.TrimPrefix(u.Path, "/") + ":pull"
-	if push {
-		s += ",push"
-	}
-	return s, nil
 }
 
 type remoteFetcher struct {

@@ -18,6 +18,8 @@ const blockThreshold = 1e6
 
 var (
 	// ErrClosed is returned when Write is called on a closed BytesPipe.
+	//
+	// Deprecated: this type is only used internally, and will be removed in the next release.
 	ErrClosed = errors.New("write to closed BytesPipe")
 
 	bufPools     = make(map[int]*sync.Pool)
@@ -28,17 +30,22 @@ var (
 // All written data may be read at most once. Also, BytesPipe allocates
 // and releases new byte slices to adjust to current needs, so the buffer
 // won't be overgrown after peak loads.
+//
+// Deprecated: this type is only used internally, and will be removed in the next release.
 type BytesPipe struct {
-	mu       sync.Mutex
-	wait     *sync.Cond
-	buf      []*fixedBuffer
-	bufLen   int
-	closeErr error // error to return from next Read. set to nil if not closed.
+	mu        sync.Mutex
+	wait      *sync.Cond
+	buf       []*fixedBuffer
+	bufLen    int
+	closeErr  error // error to return from next Read. set to nil if not closed.
+	readBlock bool  // check read BytesPipe is Wait() or not
 }
 
 // NewBytesPipe creates new BytesPipe, initialized by specified slice.
 // If buf is nil, then it will be initialized with slice which cap is 64.
 // buf will be adjusted in a way that len(buf) == 0, cap(buf) == cap(buf).
+//
+// Deprecated: this function is only used internally, and will be removed in the next release.
 func NewBytesPipe() *BytesPipe {
 	bp := &BytesPipe{}
 	bp.buf = append(bp.buf, getBuffer(minCap))
@@ -85,6 +92,9 @@ loop0:
 
 		// make sure the buffer doesn't grow too big from this write
 		for bp.bufLen >= blockThreshold {
+			if bp.readBlock {
+				bp.wait.Broadcast()
+			}
 			bp.wait.Wait()
 			if bp.closeErr != nil {
 				continue loop0
@@ -129,7 +139,9 @@ func (bp *BytesPipe) Read(p []byte) (n int, err error) {
 		if bp.closeErr != nil {
 			return 0, bp.closeErr
 		}
+		bp.readBlock = true
 		bp.wait.Wait()
+		bp.readBlock = false
 		if bp.bufLen == 0 && bp.closeErr != nil {
 			return 0, bp.closeErr
 		}

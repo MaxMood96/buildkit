@@ -32,13 +32,18 @@ type IPConfig struct {
 // Result contains the network information returned by CNI.Setup
 //
 // a) Interfaces list. Depending on the plugin, this can include the sandbox
-//    (eg, container or hypervisor) interface name and/or the host interface
-//    name, the hardware addresses of each interface, and details about the
-//    sandbox (if any) the interface is in.
+//
+//	(eg, container or hypervisor) interface name and/or the host interface
+//	name, the hardware addresses of each interface, and details about the
+//	sandbox (if any) the interface is in.
+//
 // b) IP configuration assigned to each  interface. The IPv4 and/or IPv6 addresses,
-//    gateways, and routes assigned to sandbox and/or host interfaces.
+//
+//	gateways, and routes assigned to sandbox and/or host interfaces.
+//
 // c) DNS information. Dictionary that includes DNS information for nameservers,
-//     domain, search domains and options.
+//
+//	domain, search domains and options.
 type Result struct {
 	Interfaces map[string]*Config
 	DNS        []types.DNS
@@ -52,9 +57,11 @@ func (r *Result) Raw() []*types100.Result {
 }
 
 type Config struct {
-	IPConfigs []*IPConfig
-	Mac       string
-	Sandbox   string
+	IPConfigs  []*IPConfig
+	Mac        string
+	Sandbox    string
+	PciID      string
+	SocketPath string
 }
 
 // createResult creates a Result from the given slice of types100.Result, adding
@@ -62,8 +69,6 @@ type Config struct {
 // interfaces created in the namespace. It returns an error if validation of
 // results fails, or if a network could not be found.
 func (c *libcni) createResult(results []*types100.Result) (*Result, error) {
-	c.RLock()
-	defer c.RUnlock()
 	r := &Result{
 		Interfaces: make(map[string]*Config),
 		raw:        results,
@@ -79,8 +84,10 @@ func (c *libcni) createResult(results []*types100.Result) (*Result, error) {
 		// Walk through all the interface in each result
 		for _, intf := range result.Interfaces {
 			r.Interfaces[intf.Name] = &Config{
-				Mac:     intf.Mac,
-				Sandbox: intf.Sandbox,
+				Mac:        intf.Mac,
+				Sandbox:    intf.Sandbox,
+				SocketPath: intf.SocketPath,
+				PciID:      intf.PciID,
 			}
 		}
 		// Walk through all the IPs in the result and attach it to corresponding

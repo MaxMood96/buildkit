@@ -3,12 +3,13 @@ package llb
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"testing"
 
-	"github.com/containerd/containerd/platforms"
-	"github.com/moby/buildkit/solver/pb"
+	"github.com/containerd/platforms"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 )
 
 func TestDefinitionEquivalence(t *testing.T) {
@@ -50,7 +51,7 @@ func TestDefinitionEquivalence(t *testing.T) {
 
 			for i := 0; i < len(def.Def); i++ {
 				res := bytes.Compare(def.Def[i], def2.Def[i])
-				require.Equal(t, res, 0)
+				require.Equal(t, 0, res)
 			}
 
 			for dgst := range def.Metadata {
@@ -106,7 +107,7 @@ func TestDefinitionInputCache(t *testing.T) {
 
 	st2 := NewState(op.Output())
 	marshalDef := &Definition{
-		Metadata: make(map[digest.Digest]pb.OpMetadata, 0),
+		Metadata: make(map[digest.Digest]OpMetadata, 0),
 	}
 	constraints := &Constraints{}
 	smc := newSourceMapCollector()
@@ -117,4 +118,36 @@ func TestDefinitionInputCache(t *testing.T) {
 	require.NoError(t, err)
 	// 1 exec + 2x2 mounts from stA and stB + 1 src = 6 vertexes
 	require.Equal(t, 6, len(vertexCache))
+
+	// make sure that walking vertices in parallel doesn't cause panic
+	var all []RunOption
+	for i := 0; i < 100; i++ {
+		var sts []RunOption
+		for j := 0; j < 100; j++ {
+			sts = append(sts, AddMount("/mnt", Scratch().Run(Shlex(fmt.Sprintf("%d-%d", i, j))).Root()))
+		}
+		all = append(all, AddMount("/mnt", Scratch().Run(append([]RunOption{Shlex("args")}, sts...)...).Root()))
+	}
+	def, err = Scratch().Run(append([]RunOption{Shlex("args")}, all...)...).Root().Marshal(context.TODO())
+	require.NoError(t, err)
+	op, err = NewDefinitionOp(def.ToPB())
+	require.NoError(t, err)
+	require.NoError(t, testParallelWalk(context.Background(), op.Output()))
+}
+
+func TestDefinitionNil(t *testing.T) {
+	// should be an error, not a panic
+	_, err := NewDefinitionOp(nil)
+	require.Error(t, err)
+}
+
+func testParallelWalk(ctx context.Context, out Output) error {
+	eg, egCtx := errgroup.WithContext(ctx)
+	for _, o := range out.Vertex(ctx, nil).Inputs() {
+		o := o
+		eg.Go(func() error {
+			return testParallelWalk(egCtx, o)
+		})
+	}
+	return eg.Wait()
 }

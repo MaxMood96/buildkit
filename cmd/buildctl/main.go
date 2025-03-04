@@ -6,17 +6,21 @@ import (
 
 	_ "github.com/moby/buildkit/client/connhelper/dockercontainer"
 	_ "github.com/moby/buildkit/client/connhelper/kubepod"
+	_ "github.com/moby/buildkit/client/connhelper/nerdctlcontainer"
+	_ "github.com/moby/buildkit/client/connhelper/npipe"
 	_ "github.com/moby/buildkit/client/connhelper/podmancontainer"
+	_ "github.com/moby/buildkit/client/connhelper/ssh"
 	bccommon "github.com/moby/buildkit/cmd/buildctl/common"
 	"github.com/moby/buildkit/solver/errdefs"
 	"github.com/moby/buildkit/util/apicaps"
 	"github.com/moby/buildkit/util/appdefaults"
+	_ "github.com/moby/buildkit/util/grpcutil/encoding/proto"
 	"github.com/moby/buildkit/util/profiler"
 	"github.com/moby/buildkit/util/stack"
-	_ "github.com/moby/buildkit/util/tracing/detect/delegated"
 	_ "github.com/moby/buildkit/util/tracing/detect/jaeger"
 	_ "github.com/moby/buildkit/util/tracing/env"
 	"github.com/moby/buildkit/version"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 	"go.opentelemetry.io/otel"
@@ -55,6 +59,12 @@ func main() {
 			Usage: "buildkitd address",
 			Value: defaultAddress,
 		},
+		// Add format flag to control log formatter
+		cli.StringFlag{
+			Name:  "log-format",
+			Usage: "log formatter: json or text",
+			Value: "text",
+		},
 		cli.StringFlag{
 			Name:  "tlsservername",
 			Usage: "buildkitd server name for certificate validation",
@@ -85,11 +95,16 @@ func main() {
 			Usage: "timeout backend connection after value seconds",
 			Value: 5,
 		},
+		cli.BoolFlag{
+			Name:  "wait",
+			Usage: "block RPCs until the connection becomes available",
+		},
 	}
 
 	app.Commands = []cli.Command{
 		diskUsageCommand,
 		pruneCommand,
+		pruneHistoriesCommand,
 		buildCommand,
 		debugCommand,
 		dialStdioCommand,
@@ -99,8 +114,16 @@ func main() {
 
 	app.Before = func(context *cli.Context) error {
 		debugEnabled = context.GlobalBool("debug")
-
-		logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
+		// Use Format flag to control log formatter
+		logFormat := context.GlobalString("log-format")
+		switch logFormat {
+		case "json":
+			logrus.SetFormatter(&logrus.JSONFormatter{})
+		case "text", "":
+			logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
+		default:
+			return errors.Errorf("unsupported log type %q", logFormat)
+		}
 		if debugEnabled {
 			logrus.SetLevel(logrus.DebugLevel)
 		}

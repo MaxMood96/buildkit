@@ -8,13 +8,13 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/containerd/containerd/archive"
-	"github.com/containerd/containerd/archive/compression"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/diff"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/mount"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/diff"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/pkg/archive"
+	"github.com/containerd/containerd/v2/pkg/archive/compression"
+	cerrdefs "github.com/containerd/errdefs"
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
@@ -37,13 +37,19 @@ type winApplier struct {
 }
 
 func (s *winApplier) Apply(ctx context.Context, desc ocispecs.Descriptor, mounts []mount.Mount, opts ...diff.ApplyOpt) (d ocispecs.Descriptor, err error) {
+	// HACK:, containerd doesn't know about vnd.docker.image.rootfs.diff.tar.zstd, but that
+	// media type is compatible w/ the oci type, so just lie and say it's the oci type
+	if desc.MediaType == images.MediaTypeDockerSchema2Layer+".zstd" {
+		desc.MediaType = ocispecs.MediaTypeImageLayerZstd
+	}
+
 	if !hasWindowsLayerMode(ctx) {
-		return s.a.Apply(ctx, desc, mounts, opts...)
+		return s.apply(ctx, desc, mounts, opts...)
 	}
 
 	compressed, err := images.DiffCompression(ctx, desc.MediaType)
 	if err != nil {
-		return ocispecs.Descriptor{}, errors.Wrapf(errdefs.ErrNotImplemented, "unsupported diff media type: %v", desc.MediaType)
+		return ocispecs.Descriptor{}, errors.Wrapf(cerrdefs.ErrNotImplemented, "unsupported diff media type: %v", desc.MediaType)
 	}
 
 	var ocidesc ocispecs.Descriptor
@@ -137,15 +143,15 @@ func filter(in io.Reader, f func(*tar.Header) bool) (io.Reader, func(error)) {
 						return err
 					}
 					if h.Size > 0 {
+						//nolint:gosec // never read into memory
 						if _, err := io.Copy(tarWriter, tarReader); err != nil {
 							return err
 						}
 					}
-				} else {
-					if h.Size > 0 {
-						if _, err := io.Copy(io.Discard, tarReader); err != nil {
-							return err
-						}
+				} else if h.Size > 0 {
+					//nolint:gosec // never read into memory
+					if _, err := io.Copy(io.Discard, tarReader); err != nil {
+						return err
 					}
 				}
 			}

@@ -8,8 +8,9 @@ import (
 	dockerfile "github.com/moby/buildkit/frontend/dockerfile/builder"
 	"github.com/moby/buildkit/frontend/gateway/grpcclient"
 	"github.com/moby/buildkit/util/appcontext"
+	"github.com/moby/buildkit/util/bklog"
+	_ "github.com/moby/buildkit/util/grpcutil/encoding/proto"
 	"github.com/moby/buildkit/util/stack"
-	"github.com/sirupsen/logrus"
 )
 
 func init() {
@@ -27,7 +28,7 @@ func main() {
 	}
 
 	if err := grpcclient.RunFromEnvironment(appcontext.Context(), dockerfile.Build); err != nil {
-		logrus.Errorf("fatal error: %+v", err)
+		bklog.L.Errorf("fatal error: %+v", err)
 		panic(err)
 	}
 }
