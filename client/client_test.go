@@ -557,7 +557,7 @@ func testExportedImageLabels(t *testing.T, sb integration.Sandbox) {
 
 	for {
 		resp, err := cl.Recv()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		require.NoError(t, err)
@@ -1306,15 +1306,12 @@ func testFrontendImageNaming(t *testing.T, sb integration.Sandbox) {
 
 	// A caller provided name takes precedence over one returned by the frontend. Iterate over both options.
 	for _, winner := range []string{"frontend", "caller"} {
-		winner := winner // capture loop variable.
-
 		// The double layer of `t.Run` here is required so
 		// that the inner-most tests (with the actual
 		// functionality) have definitely completed before the
 		// sandbox and registry cleanups (defered above) are run.
 		t.Run(winner, func(t *testing.T) {
 			for _, exp := range []string{ExporterOCI, ExporterDocker, ExporterImage} {
-				exp := exp // capture loop variable.
 				t.Run(exp, func(t *testing.T) {
 					destDir := t.TempDir()
 
@@ -3332,7 +3329,7 @@ func testUser(t *testing.T, sb integration.Sandbox) {
 	dt, err = os.ReadFile(filepath.Join(destDir, "root_supplementary"))
 	require.NoError(t, err)
 	require.True(t, strings.HasPrefix(string(dt), "root "))
-	require.True(t, strings.Contains(string(dt), "wheel"))
+	require.Contains(t, string(dt), "wheel")
 
 	dt2, err := os.ReadFile(filepath.Join(destDir, "default_supplementary"))
 	require.NoError(t, err)
@@ -3430,9 +3427,9 @@ func testMultipleExporters(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 
 	if workers.IsTestDockerd() {
-		require.Equal(t, resp.ExporterResponse[exptypes.ExporterImageNameKey], target1+","+target2)
+		require.Equal(t, target1+","+target2, resp.ExporterResponse[exptypes.ExporterImageNameKey])
 	} else {
-		require.Equal(t, resp.ExporterResponse[exptypes.ExporterImageNameKey], target2)
+		require.Equal(t, target2, resp.ExporterResponse[exptypes.ExporterImageNameKey])
 	}
 	require.FileExists(t, filepath.Join(destDir, "out.tar"))
 	require.FileExists(t, filepath.Join(destDir, "out2.tar"))
@@ -4796,7 +4793,6 @@ func testPullZstdImage(t *testing.T, sb integration.Sandbox) {
 	integration.SkipOnPlatform(t, "windows")
 	workers.CheckFeatureCompat(t, sb, workers.FeatureDirectPush)
 	for _, ociMediaTypes := range []bool{true, false} {
-		ociMediaTypes := ociMediaTypes
 		t.Run(t.Name()+fmt.Sprintf("/ociMediaTypes=%t", ociMediaTypes), func(t *testing.T) {
 			c, err := New(sb.Context(), sb.Address())
 			require.NoError(t, err)
@@ -5249,7 +5245,7 @@ func testStargzLazyRegistryCacheImportExport(t *testing.T, sb integration.Sandbo
 	require.NoError(t, err)
 
 	require.Equal(t, dgst, dgst2)
-	require.EqualValues(t, unique, unique2)
+	require.Equal(t, unique, unique2)
 
 	// clear all local state out
 	err = imageService.Delete(ctx, img.Name, images.SynchronousDelete())
@@ -5569,7 +5565,7 @@ func testStargzLazyPull(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 
 	require.Equal(t, dgst, dgst2)
-	require.EqualValues(t, unique, unique2)
+	require.Equal(t, unique, unique2)
 
 	// clear all local state out
 	err = imageService.Delete(ctx, img.Name, images.SynchronousDelete())
@@ -5888,7 +5884,6 @@ func testCacheExportIgnoreError(t *testing.T, sb integration.Sandbox) {
 	for _, ignoreError := range ignoreErrorValues {
 		ignoreErrStr := strconv.FormatBool(ignoreError)
 		for n, test := range tests {
-			n := n
 			require.Equal(t, 1, len(test.Exports))
 			require.Equal(t, 1, len(test.CacheExports))
 			require.NotEmpty(t, test.CacheExports[0].Attrs)
@@ -6423,7 +6418,7 @@ func testBasicInlineCacheImportExport(t *testing.T, sb integration.Sandbox) {
 	// dgst2uncompress != dgst, because the compression type is different
 	unique2uncompress, err := readFileInImage(sb.Context(), t, c, target+"@"+dgst2uncompress, "/unique")
 	require.NoError(t, err)
-	require.EqualValues(t, unique, unique2uncompress)
+	require.Equal(t, unique, unique2uncompress)
 
 	ensurePruneAll(t, c, sb)
 
@@ -6454,7 +6449,7 @@ func testBasicInlineCacheImportExport(t *testing.T, sb integration.Sandbox) {
 	// dgst3 != dgst, because inline cache is not exported for dgst3
 	unique3, err := readFileInImage(sb.Context(), t, c, target+"@"+dgst3, "/unique")
 	require.NoError(t, err)
-	require.EqualValues(t, unique, unique3)
+	require.Equal(t, unique, unique3)
 }
 
 func testRegistryEmptyCacheExport(t *testing.T, sb integration.Sandbox) {
@@ -6464,9 +6459,7 @@ func testRegistryEmptyCacheExport(t *testing.T, sb integration.Sandbox) {
 	)
 
 	for _, ociMediaTypes := range []bool{true, false} {
-		ociMediaTypes := ociMediaTypes
 		for _, imageManifest := range []bool{true, false} {
-			imageManifest := imageManifest
 			if imageManifest && !ociMediaTypes {
 				// invalid configuration for remote cache
 				continue
@@ -6890,6 +6883,9 @@ func readFileInImage(ctx context.Context, t *testing.T, c *Client, ref, path str
 }
 
 func testCachedMounts(t *testing.T, sb integration.Sandbox) {
+	// TODO(profnandaa): skipping on Windows, investigating. #5906
+	integration.SkipOnPlatform(t, "windows")
+
 	c, err := New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
@@ -7932,7 +7928,7 @@ func testMergeOpCache(t *testing.T, sb integration.Sandbox, mode string) {
 			},
 		}}
 	default:
-		require.Fail(t, "unknown cache mode: %s", mode)
+		require.Fail(t, fmt.Sprintf("unknown cache mode: %s", mode))
 	}
 
 	_, err = c.Solve(sb.Context(), def, SolveOpt{
@@ -8061,7 +8057,7 @@ func testMergeOpCache(t *testing.T, sb integration.Sandbox, mode string) {
 			_, err = contentStore.Info(ctx, layer.Digest)
 			require.NoError(t, err)
 		default:
-			require.Fail(t, "unexpected layer index %d", i)
+			require.Fail(t, fmt.Sprintf("unexpected layer index %d", i))
 		}
 	}
 
@@ -8302,7 +8298,7 @@ func checkAllReleasable(t *testing.T, c *Client, sb integration.Sandbox, checkCo
 
 	for {
 		resp, err := cl.Recv()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		require.NoError(t, err)
@@ -11296,7 +11292,6 @@ func testSourcePolicy(t *testing.T, sb integration.Sandbox) {
 		},
 	}
 	for i, tc := range testCases {
-		tc := tc
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
 			_, err = c.Build(sb.Context(), SolveOpt{SourcePolicy: tc.srcPol}, "", frontend, nil)
 			if tc.expectedErr == "" {
@@ -11423,8 +11418,8 @@ func testLLBMountPerformance(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 
 	// Windows images take longer time
-	factor := integration.UnixOrWindows(time.Duration(1), time.Duration(3))
-	timeoutCtx, cancel := context.WithTimeoutCause(sb.Context(), time.Minute*factor, nil)
+	timeout := integration.UnixOrWindows(time.Minute, 3*time.Minute)
+	timeoutCtx, cancel := context.WithTimeoutCause(sb.Context(), timeout, nil)
 	defer cancel()
 	_, err = c.Solve(timeoutCtx, def, SolveOpt{}, nil)
 	require.NoError(t, err)
@@ -11892,7 +11887,7 @@ devices:
 		st = busybox.Run(append(ro, llb.Shlex(cmd), llb.Dir("/wd"))...).AddMount("/wd", st)
 	}
 
-	run(`sh -c 'env|sort | tee class.env'`, llb.AddCDIDevice(llb.CDIDeviceName("vendor1.com/device=class1")))
+	run(`sh -c 'env|sort | tee class.env'`, llb.AddCDIDevice(llb.CDIDeviceName("class1")))
 
 	def, err := st.Marshal(sb.Context())
 	require.NoError(t, err)

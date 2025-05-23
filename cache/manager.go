@@ -10,9 +10,11 @@ import (
 	"sync"
 	"time"
 
+	obdlabel "github.com/containerd/accelerated-container-image/pkg/label"
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/pkg/filters"
 	"github.com/containerd/containerd/v2/pkg/gc"
 	"github.com/containerd/containerd/v2/pkg/labels"
@@ -628,6 +630,10 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, sess session.Gr
 		}); rerr != nil {
 			return nil, rerr
 		}
+	} else if cm.Snapshotter.Name() == "overlaybd" && parent != nil {
+		// Snapshotter will create a R/W block device directly as rootfs with this label
+		rwLabels := map[string]string{obdlabel.SupportReadWriteMode: "dev"}
+		err = cm.Snapshotter.Prepare(ctx, snapshotID, parentSnapshotID, snapshots.WithLabels(rwLabels))
 	} else {
 		err = cm.Snapshotter.Prepare(ctx, snapshotID, parentSnapshotID)
 	}
@@ -1427,10 +1433,7 @@ func (cm *cacheManager) DiskUsage(ctx context.Context, opt client.DiskUsageInfo)
 	}
 	cm.mu.Unlock()
 
-	for {
-		if len(rescan) == 0 {
-			break
-		}
+	for len(rescan) != 0 {
 		for id := range rescan {
 			v := m[id]
 			if v.refs == 0 {
@@ -1449,6 +1452,7 @@ func (cm *cacheManager) DiskUsage(ctx context.Context, opt client.DiskUsageInfo)
 	if err := cm.markShared(m); err != nil {
 		return nil, err
 	}
+	cutOff := time.Now().Add(-opt.AgeLimit)
 
 	var du []*client.UsageInfo
 	for id, cr := range m {
@@ -1465,9 +1469,15 @@ func (cm *cacheManager) DiskUsage(ctx context.Context, opt client.DiskUsageInfo)
 			RecordType:  cr.recordType,
 			Shared:      cr.shared,
 		}
-		if filter.Match(adaptUsageInfo(c)) {
-			du = append(du, c)
+		if !filter.Match(adaptUsageInfo(c)) {
+			continue
 		}
+		if opt.AgeLimit > 0 {
+			if c.LastUsedAt != nil && c.LastUsedAt.After(cutOff) {
+				continue
+			}
+		}
+		du = append(du, c)
 	}
 
 	eg, ctx := errgroup.WithContext(ctx)
